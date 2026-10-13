@@ -1,6 +1,6 @@
 # Tacklebox Roadmap
 
-**Last updated**: 2026-08-17
+**Last updated**: 2026-10-13
 
 Part of the [TunaOS](https://tunaos.org) ecosystem. Multi-boot media orchestrator for bootc.
 
@@ -18,27 +18,22 @@ Part of the [TunaOS](https://tunaos.org) ecosystem. Multi-boot media orchestrato
 - ✅ Cross-platform GUI multi-boot USB manager (`tuna-os/iso-builder` native app): Inspection, add/remove/update lifecycle, cross-platform helper VMs (macOS QEMU, Windows WSL2), and VM boot verification (#104)
 - ✅ CI pipeline: lint, unit, block smoke, ISO smoke, 6-env scale test
 
-## Near-term release gate
+## Near-term: First Versioned Release Gate (Tracking #237)
 
-Tacklebox is consumed by downstream TunaOS build tooling, but has not yet
-published a versioned release. Before expanding the feature surface, establish
-the first supported baseline and make it possible for downstream users to pin
-and evaluate it.
+Tacklebox is consumed by downstream TunaOS build tooling but has not yet published a versioned release. Before expanding the feature surface, establish the first supported baseline.
+
+**Status (2026-10-13)**: Release gate #237 open since Aug 17 with no recent updates. Gate criteria and timeline need refresh.
 
 The first versioned release is ready when:
 
-- the release commit passes unit, block-device, ISO boot, and cross-platform
-  disk smoke checks;
-- GitHub Releases contains Linux amd64 and arm64 binaries with checksums, and
-  GHCR contains matching immutable version and digest references;
-- release notes identify supported targets, known limitations, compatibility
-  expectations for recipes and media, and the rollback path;
-- TunaOS consumers replace mutable `main` or `latest` references with the
-  versioned release or an immutable digest; and
-- a 30-day review records downstream upgrade results, external install/use
-  feedback, and release defects to inform the next version.
+- ✅ Release commit passes unit, block-device, ISO boot, and cross-platform disk smoke checks (CI green)
+- ⏳ GitHub Releases contains Linux amd64 and arm64 binaries with checksums (release automation status unclear)
+- ⏳ GHCR contains matching immutable version and digest references (asset publication pipeline status unclear)
+- 🔴 Release notes identify supported targets, known limitations, compatibility expectations (not yet drafted)
+- 🔴 TunaOS consumers replaceutable `main`/`latest` with versioned release (requires release to exist first)
+- 🔴 30-day review records downstream upgrade results and feedback (gate not yet started)
 
-Tracking: #237
+**Blockers**: No release automation documented. Asset publication pipeline status unknown. Release notes template missing.
 
 ## Planned
 
@@ -48,5 +43,24 @@ Tracking: #237
 - **ARM64 multi-ISO** — aarch64 sd-boot + OVMF testing
 
 ## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for build, test, and merge requirements.
+
+---
+
+## Strategic Notes (2026-10-13 Refresh)
+
+**Release Gate Stalled**: Issue #237 has been open since August 17 (58 days) with no visible progress on release automation, asset pipeline, or release notes. This blocks:
+- Consumer adoption (no versioned release to pin to)
+- Downstream stability (still using `main` branch)
+- Rollback guarantees (no release artifacts to fall back to)
+
+**Recommended Next Steps**:
+1. Establish release automation decision: manual cut vs automated (like fisherman's `promote.yml`)
+2. Define release notes template and supported-targets matrix
+3. Create release readiness checklist and assign ownership
+4. Set target date for v0.1.0 or v1.0.0 release
+
+**Owner**: Needs human decision on release strategy before implementation can proceed.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
