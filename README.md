@@ -224,6 +224,13 @@ zstd level 15. This level creates files that are about 10–15% smaller, but
 takes more time. The `SUPERISO_COMPRESSION=release` environment variable
 overrides the recipe.
 
+`shared_store.compressor` picks the squashfs compressor for every squashfs the
+build writes (live rootfs, dedup layouts and the offline store): `zstd`
+(default), `xz`, `gzip`, `lz4` or `lzo`. The kernel in the image must support
+it. Arch Linux ARM's `linux-aarch64`, for example, has no
+`CONFIG_SQUASHFS_ZSTD`, so its live ISOs need `"compressor": "xz"`. The
+`TACKLEBOX_SQUASHFS_COMPRESSOR` environment variable overrides the recipe.
+
 `shared_store.dedup` applies only to ISO targets and defaults to `false`. It
 packs every environment into **one** combined squashfs, with one subtree per
 environment. `mksquashfs` stores only one copy of files that the images share.
@@ -308,3 +315,10 @@ just build-xz
 ---
 
 Part of the [TunaOS](https://tunaos.org) ecosystem. [Docs](https://tunaos.org) · [Contribution guide](CONTRIBUTING.md)
+
+<!-- hive-contribute-plea: donated-compute appeal, keep in sync across repos -->
+## Contribute compute — no code needed
+
+No time to write code? You can still push this project's backlog forward. A TunaOS AI-agent hive works on this repository. Lend the hive your AI subscription or API tokens, and your machine runs tasks from this project's backlog.
+
+- 🏫 [Contribute compute to the school hive](https://school.tunaos.org/contribute)
