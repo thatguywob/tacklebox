@@ -86,6 +86,7 @@ func main() {
 		trim       = flag.String("trim", "var/cache,var/log,var/tmp,tmp,run", "comma-separated rootfs paths emptied before authoring (boot-irrelevant caches)")
 		ddi        = flag.String("ddi", "", "build from a systemd-sysupdate v1 artifact directory (URL or local path containing SHA256SUMS + UKI + root.raw[.xz]) instead of an OCI image — tacklebox#172")
 		ddiStem    = flag.String("ddi-stem", "", "artifact stem to select in the DDI manifest (e.g. snow-ab); required when the manifest lists several")
+		strict     = flag.Bool("strict", false, "fail instead of warn when the image's flatpak preinstall.d asks for a flatpak the rootfs does not carry")
 		overlays   stringList
 		liveMarker = flag.String("live-marker", "", "readiness string the baked tbox-live-ready.service prints to the serial console (default "+purefs.DefaultLiveMarker+")")
 	)
@@ -222,6 +223,24 @@ func main() {
 			log.Fatalf("overlay %s: %v", o, err)
 		}
 		log.Printf(">>> overlay %s applied", o)
+	}
+
+	// The image declares its flatpaks in preinstall.d (tacklebox#326), but
+	// this path cannot run `flatpak preinstall`: whatever the live overlay,
+	// the customized --rootfs-tar or a caller --overlay carries is all the
+	// ISO gets. Say so rather than letting a stale overlay ship without them;
+	// checked after every overlay so the final rootfs is what is judged.
+	if missing := purefs.MissingPreinstalls(root, store); len(missing) > 0 {
+		ids := make([]string, len(missing))
+		for i, r := range missing {
+			ids[i] = r.Kind() + "/" + r.ID + "//" + r.Branch
+		}
+		msg := fmt.Sprintf("image preinstall.d asks for %d flatpak(s) the live rootfs lacks: %s",
+			len(missing), strings.Join(ids, ", "))
+		if *strict {
+			log.Fatal(msg)
+		}
+		log.Printf(">>> WARNING: %s", msg)
 	}
 
 	// Kernel + stock initramfs + systemd-boot out of the image tree.
