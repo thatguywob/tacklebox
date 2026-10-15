@@ -298,56 +298,6 @@ func TestTempSquashFile_CreatesWorldWritableFile(t *testing.T) {
 	}
 }
 
-// --- ExtractEFIBinary ---
-// The host EFI binary paths are hardcoded absolute paths, not injectable,
-// so this test adapts to whichever branch is actually true on the machine
-// running it rather than assuming either way — both are real, valid
-// states (most CI runners won't have systemd-boot-efi installed; some
-// dev/build machines will).
-
-func TestExtractEFIBinary(t *testing.T) {
-	m := newMockRunner(t)
-	destDir := t.TempDir()
-
-	hostBins := []struct{ src, dst string }{
-		{"/usr/lib/systemd/boot/efi/systemd-bootx64.efi", "BOOTX64.EFI"},
-		{"/usr/lib/systemd/boot/efi/systemd-bootaa64.efi", "BOOTAA64.EFI"},
-	}
-	var wantDst string
-	for _, b := range hostBins {
-		if info, err := os.Stat(b.src); err == nil && !info.IsDir() {
-			wantDst = b.dst
-			break
-		}
-	}
-
-	dst, err := ExtractEFIBinary("ghcr.io/test/image:latest", destDir)
-
-	if wantDst == "" {
-		// No host EFI binary — this app's honest, real fallback state
-		// on most CI runners and minimal dev machines.
-		if err == nil {
-			t.Fatal("expected an error when no host EFI binary is present")
-		}
-		if !strings.Contains(err.Error(), "no systemd-boot EFI binary") {
-			t.Errorf("error should explain what's missing, got: %v", err)
-		}
-	} else {
-		if err != nil {
-			t.Fatalf("host has %s — expected success, got: %v", wantDst, err)
-		}
-		if dst != wantDst {
-			t.Errorf("returned dst = %q, want %q", dst, wantDst)
-		}
-		if !m.anyCallContains("cp") {
-			t.Error("expected the found EFI binary to be copied via runner.Run")
-		}
-	}
-	if !m.anyCallContains("mkdir -p " + destDir) {
-		t.Error("expected destDir to be created before the search")
-	}
-}
-
 // --- CleanupStaging ---
 
 func TestCleanupStaging_RemovesEveryCachedDirAndResetsCache(t *testing.T) {

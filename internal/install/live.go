@@ -556,13 +556,6 @@ func placeSquashfs(cachePath, dst string) error {
 	return nil
 }
 
-// ExtractEFIBinary copies a systemd-boot EFI binary into destDir,
-// returning the basename written ("BOOTX64.EFI" / "BOOTAA64.EFI").
-// It probes the image first, falling back to the build host.
-func ExtractEFIBinary(image, destDir string) (string, error) {
-	return StageBootloader(image, destDir)
-}
-
 // shellEsc single-quotes a string for safe interpolation into a shell script.
 // Embedded single quotes are escaped with the '"'"' idiom.
 func shellEsc(s string) string {
