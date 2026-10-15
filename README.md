@@ -85,10 +85,10 @@ Tacklebox automatically handles these requirements of the Composefs backend:
 
 ## 📚 Documentation
 
-*   [User guide](docs/USER-GUIDE.md) — commands, recipe reference, ISO/dedup layouts, day-2 operations, troubleshooting
+*   [User guide](docs/USER-GUIDE.md) — commands, recipe reference, ISO/dedup layouts, day-2 operations, problem diagnosis
 *   [Architecture](ARCHITECTURE.md) — build pipeline, boot chain, package layout
-*   [GitHub ISO setup](docs/github-iso-setup.md) — building ISOs in CI, including the host packages required
-*   [Runbooks](runbooks/) — build/ISO generation and boot/update troubleshooting
+*   [GitHub ISO setup](docs/github-iso-setup.md) — ISO builds in CI, with the necessary host packages
+*   [Runbooks](runbooks/) — build/ISO generation and boot/update problem diagnosis
 
 ## 🛠 Usage
 
@@ -129,7 +129,7 @@ sudo tacklebox build recipe.json --iso ./myos.iso
 ```
 Every environment is installed in live mode. See the
 [user guide](docs/USER-GUIDE.md) for the full ISO workflow and
-[`docs/github-iso-setup.md`](docs/github-iso-setup.md) for building ISOs in CI.
+[`docs/github-iso-setup.md`](docs/github-iso-setup.md) for ISO builds in CI.
 
 ### Provision a Physical USB Drive
 ```bash
@@ -295,8 +295,8 @@ every image ID. See `examples/iso-dedup.json`.
 ## 🏗 Requirements
 
 You need Go only to build Tacklebox from source. Use the version in
-[`go.mod`](go.mod). Creating media with the installed CLI needs root and the
-host tools below.
+[`go.mod`](go.mod). To create media with the installed CLI, you need root and
+the host tools below.
 
 Every target:
 
@@ -305,13 +305,13 @@ Every target:
     `backend` explicitly in the recipe
 *   `xz` (for `--xz` outputs)
 
-Disk image / USB targets additionally:
+Disk image / USB targets also need:
 
 *   `bootc`
 *   `sgdisk` (gdisk)
 *   `mkfs.vfat`, `mkfs.ext4` (with verity support)
 
-ISO targets (`--iso`) additionally:
+ISO targets (`--iso`) also need:
 
 *   `mksquashfs` — squashes each environment's root filesystem
 *   `xorriso` — wraps the staged tree into the ISO
