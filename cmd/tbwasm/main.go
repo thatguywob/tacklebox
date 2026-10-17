@@ -40,23 +40,47 @@ import (
 )
 
 var (
-	gRoot     *oci.Node
-	gStore    *hybridStore
-	gFacts    purefs.ImageFacts
-	gClient   *oci.Client
-	gManifest *oci.Manifest
-	gImage    string
+	gRoot           *oci.Node
+	gStore          *hybridStore
+	gFacts          purefs.ImageFacts
+	gClient         *oci.Client
+	gManifest       *oci.Manifest
+	gImage          string
+	gPlatform       string
+	gManifestDigest string
+	gRequest        *purefs.BuildRequest
+	// gBlobArena retains the verified compressed base-layer bytes across
+	// the introspect/buildIso calls (the wasm heap cannot hold them, and
+	// the registry must not be asked twice). gBlobRefs maps full digest
+	// ("sha256:<hex>") to arena ref; gBlobSizes carries the retained
+	// length for the descriptor cross-check at embed time.
+	gBlobArena *opfsArena
+	gBlobRefs  map[string]string
+	gBlobSizes map[string]int64
 )
+
+func resetGlobalState() {
+	if gStore != nil {
+		gStore.destroy()
+	}
+	if gBlobArena != nil {
+		gBlobArena.Destroy()
+	}
+	gRoot, gStore = nil, nil
+	gBlobArena = nil
+	gBlobRefs, gBlobSizes = nil, nil
+	gClient, gManifest = nil, nil
+	gImage, gPlatform, gManifestDigest = "", "", ""
+	gRequest = nil
+}
 
 func main() {
 	js.Global().Set("tboxIntrospect", js.FuncOf(introspect))
 	js.Global().Set("tboxBuildIso", js.FuncOf(buildIso))
 	js.Global().Set("tboxBuildDdiIso", js.FuncOf(buildDdiIso))
+	js.Global().Set("tboxExportBuildRequest", js.FuncOf(exportBuildRequest))
 	js.Global().Set("tboxReset", js.FuncOf(func(js.Value, []js.Value) any {
-		if gStore != nil {
-			gStore.destroy()
-		}
-		gRoot, gStore = nil, nil
+		resetGlobalState()
 		return nil
 	}))
 	select {}
@@ -117,16 +141,164 @@ func reportMem(phase string) {
 		phase, ms.HeapAlloc>>20, ms.Sys>>20, ms.HeapObjects, layerMB, postMB)
 }
 
-func introspect(_ js.Value, args []js.Value) any {
-	image := args[0].String()
-	registry := "https://ghcr.io"
-	if len(args) > 1 && args[1].Type() == js.TypeString && args[1].String() != "" {
-		registry = args[1].String()
+func parseJSBuildRequestValue(v js.Value) (*purefs.BuildRequest, error) {
+	switch v.Type() {
+	case js.TypeUndefined, js.TypeNull:
+		return nil, nil
+	case js.TypeString:
+		s := strings.TrimSpace(v.String())
+		if s == "" {
+			return nil, nil
+		}
+		return purefs.ParseBuildRequest([]byte(s))
+	case js.TypeObject:
+		if v.IsNull() {
+			return nil, nil
+		}
+		// Copy only JSON-serializable BuildRequest fields so large binary buffers
+		// (like opts.initrd Uint8Array) are never passed through JSON.stringify.
+		clean := js.Global().Get("Object").New()
+		hasRequestField := false
+		for _, k := range []string{
+			"schemaVersion", "kind", "customImage", "image", "registry",
+			"target", "resolvedInputs", "options", "catalogVersion", "qualificationId",
+		} {
+			fv := v.Get(k)
+			if fv.Type() != js.TypeUndefined && fv.Type() != js.TypeNull {
+				clean.Set(k, fv)
+				hasRequestField = true
+			}
+		}
+		if !hasRequestField {
+			return nil, nil
+		}
+		s := js.Global().Get("JSON").Call("stringify", clean).String()
+		return purefs.ParseBuildRequest([]byte(s))
+	default:
+		return nil, fmt.Errorf("invalid build request value type %s", v.Type())
 	}
+}
+
+func extractBuildRequestFromOpts(opts js.Value) (*purefs.BuildRequest, error) {
+	if opts.Type() == js.TypeString {
+		s := strings.TrimSpace(opts.String())
+		if strings.HasPrefix(s, "{") {
+			return purefs.ParseBuildRequest([]byte(s))
+		}
+		return nil, nil
+	}
+	if opts.Type() != js.TypeObject || opts.IsNull() {
+		return nil, nil
+	}
+	if reqVal := opts.Get("request"); reqVal.Type() != js.TypeUndefined && reqVal.Type() != js.TypeNull {
+		return parseJSBuildRequestValue(reqVal)
+	}
+	// Check whether opts itself carries top-level BuildRequest v1 fields.
+	for _, marker := range []string{"kind", "schemaVersion", "target", "resolvedInputs", "image", "customImage", "qualificationId"} {
+		if mv := opts.Get(marker); mv.Type() != js.TypeUndefined && mv.Type() != js.TypeNull {
+			return parseJSBuildRequestValue(opts)
+		}
+	}
+	return nil, nil
+}
+
+func parseIntrospectArgs(args []js.Value) (image, registry, platform string, req *purefs.BuildRequest, err error) {
+	registry = purefs.DefaultRegistry
+	platform = "amd64"
+	if len(args) == 0 {
+		return "", "", "", nil, fmt.Errorf("tboxIntrospect requires an image or options argument")
+	}
+	first := args[0]
+	switch first.Type() {
+	case js.TypeString:
+		s := strings.TrimSpace(first.String())
+		if strings.HasPrefix(s, "{") {
+			var raw map[string]json.RawMessage
+			if uerr := json.Unmarshal([]byte(s), &raw); uerr != nil {
+				return "", "", "", nil, fmt.Errorf("parse introspect options: %w", uerr)
+			}
+			if reqBytes, ok := raw["request"]; ok && len(reqBytes) > 0 && string(reqBytes) != "null" {
+				req, err = purefs.ParseBuildRequest(reqBytes)
+				if err != nil {
+					return "", "", "", nil, err
+				}
+			} else if _, hasTarget := raw["target"]; hasTarget || raw["kind"] != nil || raw["resolvedInputs"] != nil || raw["schemaVersion"] != nil {
+				req, err = purefs.ParseBuildRequest([]byte(s))
+				if err != nil {
+					return "", "", "", nil, err
+				}
+			}
+			var wrapper struct {
+				Image    string `json:"image"`
+				Registry string `json:"registry"`
+				Platform string `json:"platform"`
+			}
+			_ = json.Unmarshal([]byte(s), &wrapper)
+			image = wrapper.Image
+			if wrapper.Registry != "" {
+				registry = wrapper.Registry
+			}
+			if wrapper.Platform != "" {
+				platform = wrapper.Platform
+			}
+		} else {
+			image = s
+			if len(args) > 1 && args[1].Type() == js.TypeString && args[1].String() != "" {
+				registry = args[1].String()
+			}
+			if len(args) > 2 && args[2].Type() == js.TypeString && args[2].String() != "" {
+				platform = args[2].String()
+			}
+		}
+	case js.TypeObject:
+		if first.IsNull() {
+			return "", "", "", nil, fmt.Errorf("introspect options cannot be null")
+		}
+		req, err = extractBuildRequestFromOpts(first)
+		if err != nil {
+			return "", "", "", nil, err
+		}
+		if v := first.Get("image"); v.Type() == js.TypeString && v.String() != "" {
+			image = v.String()
+		}
+		if v := first.Get("registry"); v.Type() == js.TypeString && v.String() != "" {
+			registry = v.String()
+		}
+		if v := first.Get("platform"); v.Type() == js.TypeString && v.String() != "" {
+			platform = v.String()
+		}
+	default:
+		return "", "", "", nil, fmt.Errorf("unsupported introspect argument type %s", first.Type())
+	}
+
+	if req != nil {
+		if image == "" {
+			image = req.Image
+		}
+		if (registry == "" || registry == purefs.DefaultRegistry) && req.Registry != "" {
+			registry = req.Registry
+		}
+		if (platform == "" || platform == "amd64") && req.Target != nil && req.Target.Platform != "" {
+			platform = req.Target.Platform
+		}
+	}
+	return image, registry, platform, req, nil
+}
+
+func introspect(_ js.Value, args []js.Value) any {
+	image, registry, platform, req, argErr := parseIntrospectArgs(args)
 	return promise(func() (any, error) {
-		repo, tag, ok := splitRef(image)
+		resetGlobalState()
+		if argErr != nil {
+			return nil, argErr
+		}
+		normImage := purefs.NormalizeImageRef(image)
+		repo, tag, ok := splitRef(normImage)
 		if !ok {
 			return nil, fmt.Errorf("image must be <repo>:<tag>")
+		}
+		if _, err := purefs.EffectivePlatformArch(platform); err != nil {
+			return nil, err
 		}
 		c := oci.NewClient(registry)
 		// Boot-irrelevant junk never hits origin storage (quota!).
@@ -140,15 +312,45 @@ func introspect(_ js.Value, args []js.Value) any {
 		}
 		ref := oci.Ref{Repo: repo, Tag: tag}
 		emitProgress("resolve", 0, 1)
-		m, err := c.ResolveManifest(ref, "amd64")
+		m, manifestDigest, err := purefs.ResolveManifestWithDigest(c, ref, platform)
 		if err != nil {
 			return nil, err
+		}
+		if req != nil {
+			if err := req.VerifyResolved(normImage, platform, manifestDigest); err != nil {
+				return nil, err
+			}
 		}
 		arena, err := newOpfsArena("tbox-arena.bin", "a")
 		if err != nil {
 			return nil, err
 		}
 		gStore = &hybridStore{arena: arena}
+		// Retain the verified compressed base layers for the offline OCI
+		// layout buildIso embeds: the hook consumes each digest-verified
+		// layer stream once, parks the bytes in their own OPFS arena (never
+		// the heap), and hands the applier a fresh reader over the retained
+		// bytes. Overlay deltas grafted later in buildIso run with the hook
+		// cleared, so customization layers can never leak into the layout.
+		blobArena, err := newOpfsArena("tbox-layerblobs.bin", "b")
+		if err != nil {
+			return nil, err
+		}
+		gBlobArena = blobArena
+		gBlobRefs = map[string]string{}
+		gBlobSizes = map[string]int64{}
+		c.RetainLayer = func(d oci.Descriptor, body io.ReadCloser) (io.ReadCloser, error) {
+			ref, size, rerr := retainArenaBlob(gBlobArena, d.Digest, body)
+			if rerr != nil {
+				return nil, rerr
+			}
+			if d.Size > 0 && size != d.Size {
+				return nil, fmt.Errorf("retained layer %s size %d != descriptor %d", d.Digest, size, d.Size)
+			}
+			gBlobRefs[d.Digest] = ref
+			gBlobSizes[d.Digest] = size
+			return gBlobArena.Open(ref)
+		}
 		// Sample inside the layer loop, not just at the end. marlin:niri
 		// died here at 4.28 GB having reported 71 MB nine layers earlier,
 		// and a single end-of-phase sample cannot tell "grew steadily"
@@ -161,6 +363,7 @@ func introspect(_ js.Value, args []js.Value) any {
 				reportMem(fmt.Sprintf("unpack-layer-%d", i))
 			}
 		})
+		c.RetainLayer = nil
 		if err != nil {
 			return nil, err
 		}
@@ -168,7 +371,9 @@ func introspect(_ js.Value, args []js.Value) any {
 			return nil, err
 		}
 		gRoot = root
-		gClient, gManifest, gImage = c, m, image
+		gClient, gManifest, gImage = c, m, normImage
+		gPlatform, gManifestDigest = platform, manifestDigest
+		gRequest = req
 		gFacts = purefs.Introspect(root, gStore)
 		reportMem("unpack")
 		b, _ := json.Marshal(gFacts)
@@ -176,25 +381,64 @@ func introspect(_ js.Value, args []js.Value) any {
 	})
 }
 
+func exportBuildRequest(_ js.Value, args []js.Value) any {
+	var req *purefs.BuildRequest
+	var err error
+	if len(args) > 0 && args[0].Type() != js.TypeUndefined && args[0].Type() != js.TypeNull {
+		req, err = extractBuildRequestFromOpts(args[0])
+		if err != nil {
+			return promise(func() (any, error) { return nil, err })
+		}
+	}
+	if req == nil && gRequest != nil {
+		cp := *gRequest
+		req = &cp
+	}
+	if req == nil {
+		req = &purefs.BuildRequest{
+			SchemaVersion: purefs.BuildRequestSchemaVersion,
+			Kind:          purefs.BuildRequestKind,
+			Image:         gImage,
+		}
+		if gPlatform != "" {
+			req.Target = &purefs.TargetIdentity{Platform: gPlatform}
+		}
+		if gManifestDigest != "" {
+			req.ResolvedInputs = &purefs.ResolvedInputs{PlatformManifestDigest: gManifestDigest}
+		}
+	}
+	return promise(func() (any, error) {
+		b, err := req.ExportJSON()
+		if err != nil {
+			return nil, err
+		}
+		return string(b), nil
+	})
+}
+
 func buildIso(_ js.Value, args []js.Value) any {
 	opts := args[0]
 	onChunk := args[1]
-	label := opts.Get("label").String()
+	req, reqErr := extractBuildRequestFromOpts(opts)
+	label := ""
+	if v := opts.Get("label"); v.Type() == js.TypeString {
+		label = v.String()
+	}
 	var initrd []byte
-	if v := opts.Get("initrd"); v.Type() == js.TypeObject {
+	if v := opts.Get("initrd"); v.Type() == js.TypeObject && !v.IsNull() {
 		initrd = make([]byte, v.Get("length").Int())
 		js.CopyBytesToGo(initrd, v)
 	}
 	var flatpaks []string
-	if v := opts.Get("flatpaks"); v.Type() == js.TypeObject {
-		for i := 0; i < v.Get("length").Int(); i++ {
+	if v := opts.Get("flatpaks"); v.Type() == js.TypeObject && !v.IsNull() {
+		for i := range v.Get("length").Int() {
 			flatpaks = append(flatpaks, v.Index(i).String())
 		}
 	}
 	strSlice := func(key string) []string {
 		var out []string
-		if v := opts.Get(key); v.Type() == js.TypeObject {
-			for i := 0; i < v.Get("length").Int(); i++ {
+		if v := opts.Get(key); v.Type() == js.TypeObject && !v.IsNull() {
+			for i := range v.Get("length").Int() {
 				out = append(out, v.Index(i).String())
 			}
 		}
@@ -207,26 +451,94 @@ func buildIso(_ js.Value, args []js.Value) any {
 		liveMarker = v.String()
 	}
 	return promise(func() (any, error) {
+		if reqErr != nil {
+			return nil, reqErr
+		}
 		if gRoot == nil {
 			return nil, fmt.Errorf("introspect an image first")
 		}
+		activeReq := req
+		if activeReq == nil {
+			activeReq = gRequest
+		}
+		if activeReq != nil {
+			if err := activeReq.Validate(); err != nil {
+				return nil, err
+			}
+			if err := activeReq.VerifyResolved(gImage, gPlatform, gManifestDigest); err != nil {
+				return nil, err
+			}
+			if label == "" {
+				label = activeReq.Options.Label
+			}
+			if len(packages) == 0 && len(activeReq.Options.Packages) > 0 {
+				packages = append([]string(nil), activeReq.Options.Packages...)
+			}
+			if len(flatpaks) == 0 && len(activeReq.Options.Flatpaks) > 0 {
+				flatpaks = append([]string(nil), activeReq.Options.Flatpaks...)
+			}
+			if len(extraRun) == 0 && len(activeReq.Options.ExtraRun) > 0 {
+				extraRun = append([]string(nil), activeReq.Options.ExtraRun...)
+			}
+			if liveMarker == "" {
+				liveMarker = activeReq.Options.LiveMarker
+			}
+		}
+		if label == "" {
+			label = "TUNAOS"
+		}
 		root, store := gRoot, gStore
 
+		// The request/target platform drives overlay resolution,
+		// base-digest verification, and ESP filename selection below: an
+		// overlay or loader resolved for the wrong architecture must
+		// refuse, never assemble silently.
+		platform := gPlatform
+		if activeReq != nil && activeReq.Target != nil && strings.TrimSpace(activeReq.Target.Platform) != "" {
+			platform = strings.TrimSpace(activeReq.Target.Platform)
+		}
+		arch, err := purefs.EffectivePlatformArch(platform)
+		if err != nil {
+			return nil, err
+		}
+		bootLoaderName, grubEfiName, err := purefs.UEFIBootNames(arch)
+		if err != nil {
+			return nil, err
+		}
+		mokEfiName, err := purefs.UEFIMokName(arch)
+		if err != nil {
+			return nil, err
+		}
+
 		// Live-overlay parity artifact (tunaOS#673) — see
-		// purefs.GraftLiveOverlay. Shared with cmd/purebuild so the native
-		// build produces the byte-identical artifact this one does; that
-		// shared call is the only thing making the two paths comparable.
-		//
-		// GraftLiveOverlay's own contract: a nil applied+nil err means no
-		// overlay was published for this variant (the common case, and the
-		// only case this build tolerates) — a non-nil err means an overlay
-		// exists but failed to apply, which purebuild treats as fatal
-		// (log.Fatal). Swallowing it here would silently ship a browser ISO
-		// missing customization that cmd/purebuild would have refused to
-		// produce, defeating the parity this call exists for.
+		// purefs.GraftLiveOverlayForPlatform. Shared with cmd/purebuild so
+		// the native build produces the byte-identical artifact this one
+		// does; that shared call is the only thing making the two paths
+		// comparable. Custom images (CustomImage: true) do not graft a
+		// curated TunaOS overlay.
 		emitProgress("overlay", 0, 1)
-		if _, err := purefs.GraftLiveOverlay(root, store, gClient, gImage, gManifest, nil); err != nil {
-			return nil, fmt.Errorf("apply live overlay: %w", err)
+		if activeReq == nil || !activeReq.CustomImage {
+			var expectedOverlay string
+			var expectedOverlayBase string
+			if activeReq != nil && activeReq.ResolvedInputs != nil {
+				expectedOverlay = strings.TrimSpace(activeReq.ResolvedInputs.LiveOverlayDigest)
+				expectedOverlayBase = strings.TrimSpace(activeReq.ResolvedInputs.LiveOverlayBaseDigest)
+			}
+			applied, overlayManifest, err := purefs.GraftLiveOverlayWithOptions(root, store, gClient, gImage, gManifest, purefs.GraftOptions{
+				Platform:              platform,
+				ExpectedOverlayDigest: expectedOverlay,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("apply live overlay: %w", err)
+			}
+			if applied && overlayManifest != nil {
+				if expectedOverlayBase != "" && expectedOverlayBase != gManifestDigest {
+					return nil, &purefs.OverlayMismatchError{Reason: purefs.OverlayReasonBaseDigestMismatch, Want: gManifestDigest, Got: expectedOverlayBase}
+				}
+				if err := purefs.VerifyLiveOverlayBase(gManifest, overlayManifest, gManifestDigest); err != nil {
+					return nil, fmt.Errorf("live overlay base verification: %w", err)
+				}
+			}
 		}
 		emitProgress("overlay", 1, 1)
 		reportMem("overlay")
@@ -246,6 +558,93 @@ func buildIso(_ js.Value, args []js.Value) any {
 		// opts.liveMarker overrides the neutral default.
 		if err := purefs.EnsureLiveReadyMarker(root, store, liveMarker); err != nil {
 			return nil, err
+		}
+
+		// Offline installation sources (Fisherman MediaInput v1). When the
+		// active BuildRequest pins exact source identity, the live root
+		// carries the live-iso-mode opt-in plus media-input.json, and the
+		// ISO carries the verified read-only OCI layout (base platform
+		// manifest + config + compressed base layers under /OCI, visible
+		// live at /run/initramfs/live/OCI). Custom images without pinned
+		// digests, and builds with no pins at all, keep their existing
+		// media shape: no markers, no layout.
+		var offlineLayout []purefs.IsoInput
+		if activeReq != nil && purefs.ShouldEmbedOfflineLayout(activeReq) {
+			if gBlobArena == nil {
+				return nil, fmt.Errorf("offline layout: no retained blobs (introspect an image first)")
+			}
+			mediaJSON, merr := purefs.WriteMediaInputJSON(
+				activeReq.Image,
+				gManifestDigest,
+				activeReq.ResolvedInputs.IndexDigest,
+				gManifest.Config.Digest,
+				purefs.OfflineLayoutLivePath,
+				activeReq.Image,
+				"linux/"+arch,
+				activeReq.CatalogVersion,
+				activeReq.QualificationID,
+			)
+			if merr != nil {
+				return nil, fmt.Errorf("offline media input: %w", merr)
+			}
+			repo, tag, ok := splitRef(gImage)
+			if !ok {
+				return nil, fmt.Errorf("offline layout: image must be <repo>:<tag>")
+			}
+			blobRef := oci.Ref{Repo: repo, Tag: tag}
+			// Config blob: never downloaded during unpack, so fetching it
+			// once by digest is a first download, not a re-download. The
+			// verifying reader checks the digest on Close.
+			cfgBody, merr := gClient.Blob(blobRef, gManifest.Config)
+			if merr != nil {
+				return nil, fmt.Errorf("offline layout config: %w", merr)
+			}
+			cfgRef, cfgSize, merr := retainArenaBlob(gBlobArena, gManifest.Config.Digest, cfgBody)
+			if merr != nil {
+				return nil, fmt.Errorf("offline layout config: %w", merr)
+			}
+			if gManifest.Config.Size > 0 && cfgSize != gManifest.Config.Size {
+				return nil, fmt.Errorf("offline layout: retained config size %d != descriptor %d", cfgSize, gManifest.Config.Size)
+			}
+			gBlobRefs[gManifest.Config.Digest] = cfgRef
+			gBlobSizes[gManifest.Config.Digest] = cfgSize
+			// Platform manifest document: the decoded form cannot
+			// reproduce digest-identical bytes, so re-fetch once by digest
+			// (kilobytes) with hash verification.
+			manifestBytes, merr := purefs.FetchManifestBytes(gClient, blobRef, gManifestDigest)
+			if merr != nil {
+				return nil, fmt.Errorf("offline layout manifest: %w", merr)
+			}
+			manifestRef, merr := retainArenaReader(gBlobArena, bytes.NewReader(manifestBytes))
+			if merr != nil {
+				return nil, fmt.Errorf("offline layout manifest: %w", merr)
+			}
+			gBlobRefs[gManifestDigest] = manifestRef
+			gBlobSizes[gManifestDigest] = int64(len(manifestBytes))
+			// Every base layer must have been retained by the introspect
+			// unpack; a gap fails the build instead of shipping a layout
+			// with holes.
+			for _, l := range gManifest.Layers {
+				if _, ok := gBlobRefs[l.Digest]; !ok {
+					return nil, fmt.Errorf("offline layout: layer %s was not retained during unpack", l.Digest)
+				}
+				if l.Size > 0 && gBlobSizes[l.Digest] != l.Size {
+					return nil, fmt.Errorf("offline layout: retained layer %s size %d != descriptor %d", l.Digest, gBlobSizes[l.Digest], l.Size)
+				}
+			}
+			if err := purefs.WriteLiveMarkerFiles(root, store, mediaJSON); err != nil {
+				return nil, err
+			}
+			if err := gBlobArena.Seal(); err != nil {
+				return nil, fmt.Errorf("seal offline blob arena: %w", err)
+			}
+			offlineLayout, merr = purefs.OCILayoutInputs(
+				&arenaDigestStore{arena: gBlobArena, refs: gBlobRefs},
+				gManifest, gManifestDigest, gManifest.Config.Digest,
+			)
+			if merr != nil {
+				return nil, fmt.Errorf("offline layout: %w", merr)
+			}
 		}
 
 		kver := gFacts.KernelVer
@@ -323,14 +722,15 @@ func buildIso(_ js.Value, args []js.Value) any {
 		if err != nil {
 			return nil, fmt.Errorf("no initramfs in image: %w", err)
 		}
-		// Two boot chains, resolved wootc-style from the tree (see
-		// purefs.DetectBootChain): systemd-boot when the image ships it
-		// (Debian ships only the .signed name — an sbat-signed PE that
-		// boots unchanged), else the signed shim+GRUB pair from the
-		// image's bootupd payload. aurora/bluefin-family images carry no
-		// systemd-boot at all — this used to hard-error here with
+		// Two boot chains, resolved wootc-style from the tree for the
+		// REQUESTED architecture (see purefs.DetectBootChainForArch):
+		// systemd-boot when the image ships it (Debian ships only the
+		// .signed name — an sbat-signed PE that boots unchanged), else
+		// the signed shim+GRUB pair from the image's bootupd payload.
+		// aurora/bluefin-family images carry no systemd-boot at all —
+		// this used to hard-error here with
 		// "EL10-style images need a supplied one".
-		chain, err := purefs.DetectBootChain(root)
+		chain, err := purefs.DetectBootChainForArch(root, arch)
 		if err != nil {
 			return nil, err
 		}
@@ -357,12 +757,12 @@ func buildIso(_ js.Value, args []js.Value) any {
 			entry := fmt.Sprintf("title TunaOS %s (live)\nlinux %s\ninitrd %s\noptions %s\n",
 				envID, kernelPath, initrdPath, kargs)
 			espFiles = []purefs.EspFile{
-				{Path: "/EFI/BOOT/BOOTX64.EFI", Source: sdSrc},
+				{Path: "/EFI/BOOT/" + bootLoaderName, Source: sdSrc},
 				{Path: "/loader/loader.conf", Source: purefs.StringSource("timeout 3\n")},
 				{Path: "/loader/entries/" + envID + ".conf", Source: purefs.StringSource(entry)},
 			}
 			bootInputs = []purefs.IsoInput{
-				{Path: "/EFI/BOOT/BOOTX64.EFI", Size: sdSize, Source: sdSrc},
+				{Path: "/EFI/BOOT/" + bootLoaderName, Size: sdSize, Source: sdSrc},
 			}
 		case "grub2":
 			shimSrc, shimSize, berr := blob(chain.Shim)
@@ -374,25 +774,26 @@ func buildIso(_ js.Value, args []js.Value) any {
 				return nil, berr
 			}
 			cfg := purefs.LiveGrubCfg("TunaOS "+envID+" (live)", kernelPath, initrdPath, kargs)
-			// shim boots as BOOTX64.EFI and loads grubx64.efi from its own
-			// directory; grub.cfg goes to every prefix a signed GRUB has
-			// been observed to search (its own dir and the vendor dir).
+			// shim boots as the arch fallback loader and loads the arch
+			// GRUB binary from its own directory; grub.cfg goes to every
+			// prefix a signed GRUB has been observed to search (its own
+			// dir and the vendor dir).
 			espFiles = []purefs.EspFile{
-				{Path: "/EFI/BOOT/BOOTX64.EFI", Source: shimSrc},
-				{Path: "/EFI/BOOT/grubx64.efi", Source: grubSrc},
+				{Path: "/EFI/BOOT/" + bootLoaderName, Source: shimSrc},
+				{Path: "/EFI/BOOT/" + grubEfiName, Source: grubSrc},
 				{Path: "/EFI/BOOT/grub.cfg", Source: purefs.StringSource(cfg)},
 				{Path: "/EFI/" + chain.Vendor + "/grub.cfg", Source: purefs.StringSource(cfg)},
 			}
 			bootInputs = []purefs.IsoInput{
-				{Path: "/EFI/BOOT/BOOTX64.EFI", Size: shimSize, Source: shimSrc},
-				{Path: "/EFI/BOOT/grubx64.efi", Size: grubSize, Source: grubSrc},
+				{Path: "/EFI/BOOT/" + bootLoaderName, Size: shimSize, Source: shimSrc},
+				{Path: "/EFI/BOOT/" + grubEfiName, Size: grubSize, Source: grubSrc},
 				{Path: "/EFI/BOOT/grub.cfg", Size: int64(len(cfg)), Source: bytesSource([]byte(cfg))},
 			}
 			if chain.MokMgr != "" {
 				mmSrc, mmSize, merr := blob(chain.MokMgr)
 				if merr == nil {
-					espFiles = append(espFiles, purefs.EspFile{Path: "/EFI/BOOT/mmx64.efi", Source: mmSrc})
-					bootInputs = append(bootInputs, purefs.IsoInput{Path: "/EFI/BOOT/mmx64.efi", Size: mmSize, Source: mmSrc})
+					espFiles = append(espFiles, purefs.EspFile{Path: "/EFI/BOOT/" + mokEfiName, Source: mmSrc})
+					bootInputs = append(bootInputs, purefs.IsoInput{Path: "/EFI/BOOT/" + mokEfiName, Size: mmSize, Source: mmSrc})
 				}
 			}
 		}
@@ -436,6 +837,9 @@ func buildIso(_ js.Value, args []js.Value) any {
 				Source: bytesSource([]byte(ry)),
 			})
 		}
+		// Verified offline installation sources ride alongside the live
+		// rootfs (empty when the request pins no source identity).
+		inputs = append(inputs, offlineLayout...)
 		if err := purefs.WriteIso9660(jw, label, inputs, "/EFI/efi.img"); err != nil {
 			return nil, err
 		}
@@ -460,6 +864,54 @@ func bytesSource(b []byte) func() (io.ReadCloser, error) {
 	}
 }
 
+// retainArenaBlob parks one verified blob in the offline arena and returns
+// its ref and size. It consumes body fully (streaming, bounded memory),
+// then Closes it: the client's verifying reader reports a digest mismatch
+// as the Close error, so corruption aborts the build here instead of being
+// retained and embedded.
+func retainArenaBlob(a *opfsArena, digest string, body io.ReadCloser) (string, int64, error) {
+	ref, size, err := a.Put(body)
+	cerr := body.Close()
+	if err != nil {
+		return "", 0, err
+	}
+	if cerr != nil {
+		return "", 0, fmt.Errorf("blob %s failed digest verification: %w", digest, cerr)
+	}
+	return ref, size, nil
+}
+
+// retainArenaReader parks an in-memory document (refetched manifest bytes)
+// in the offline arena.
+func retainArenaReader(a *opfsArena, r io.Reader) (string, error) {
+	ref, _, err := a.Put(r)
+	if err != nil {
+		return "", err
+	}
+	return ref, nil
+}
+
+// arenaDigestStore fronts the offline arena as a digest-addressed BlobStore
+// for purefs.OCILayoutInputs: Open takes the full "sha256:<hex>" digest and
+// resolves it through the retention index recorded during unpack. Read-only;
+// retention happens through retainArenaBlob, not Put.
+type arenaDigestStore struct {
+	arena *opfsArena
+	refs  map[string]string
+}
+
+func (s *arenaDigestStore) Put(r io.Reader) (string, int64, error) {
+	return "", 0, fmt.Errorf("offline layout store is read-only")
+}
+
+func (s *arenaDigestStore) Open(ref string) (io.ReadCloser, error) {
+	r, ok := s.refs[ref]
+	if !ok {
+		return nil, fmt.Errorf("offline layout blob %q was not retained during unpack", ref)
+	}
+	return s.arena.Open(r)
+}
+
 func mustSize(src func() (io.ReadCloser, error)) int64 {
 	rc, err := src()
 	if err != nil {
@@ -475,10 +927,46 @@ type jsChunkWriter struct {
 	written int
 }
 
+type jsSinkWriter = jsChunkWriter
+
+func invokeJSSink(cb js.Value, u8 js.Value) (res js.Value, err error) {
+	if cb.Type() != js.TypeFunction {
+		return js.Value{}, fmt.Errorf("sink write failed: callback is not a function")
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("sink write failed: %v", r)
+		}
+	}()
+	res = cb.Invoke(u8)
+	return res, nil
+}
+
 func (w *jsChunkWriter) Write(p []byte) (int, error) {
 	u8 := js.Global().Get("Uint8Array").New(len(p))
 	js.CopyBytesToJS(u8, p)
-	w.cb.Invoke(u8)
+	res, err := invokeJSSink(w.cb, u8)
+	if err != nil {
+		return 0, err
+	}
+	if res.Type() == js.TypeObject && !res.IsNull() {
+		if res.Get("then").Type() == js.TypeFunction {
+			resolved, aerr := await(res)
+			if aerr != nil {
+				return 0, fmt.Errorf("sink write failed: %w", aerr)
+			}
+			res = resolved
+		}
+	}
+	if res.Type() == js.TypeObject && !res.IsNull() {
+		if errVal := res.Get("error"); errVal.Type() != js.TypeUndefined && errVal.Type() != js.TypeNull {
+			if errVal.Type() != js.TypeBoolean || errVal.Bool() {
+				return 0, fmt.Errorf("sink write failed: %s", jsErrString(errVal))
+			}
+		}
+	} else if res.Type() == js.TypeBoolean && !res.Bool() {
+		return 0, fmt.Errorf("sink write failed: sink returned false")
+	}
 	w.written += len(p)
 	return len(p), nil
 }

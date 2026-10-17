@@ -54,6 +54,10 @@ const DefaultResumeAttempts = 4
 // errors so callers can tell "the network died" from "the image is wrong".
 var ErrStalled = errors.New("layer download stalled")
 
+// errReaderClosed fails Reads after Close so a late or concurrent Read can
+// never trigger a fresh Range reopen on a discarded stream.
+var errReaderClosed = errors.New("layer download closed")
+
 // openAt opens the blob starting at byte offset. offset 0 must return the
 // whole blob.
 type openAt func(offset int64) (io.ReadCloser, error)
@@ -72,9 +76,11 @@ type resumingReader struct {
 	ch   chan chunk
 	dead chan struct{} // closed to tell a pump its output is no longer wanted
 
-	off  int64 // bytes handed to the caller; also the resume offset
-	pend []byte
-	err  error
+	off    int64  // bytes handed to the caller; also the resume offset
+	pend   []byte // bytes received but not yet handed out
+	stash  error  // transport error held back while its final bytes drain
+	closed bool   // Close was called; Reads fail instead of resuming
+	err    error
 }
 
 func newResumingReader(open openAt, idle time.Duration, attempts int) (*resumingReader, error) {
@@ -139,6 +145,9 @@ func (r *resumingReader) abandon() {
 
 func (r *resumingReader) Read(p []byte) (int, error) {
 	for {
+		if r.closed {
+			return 0, errReaderClosed
+		}
 		if len(r.pend) > 0 {
 			n := copy(p, r.pend)
 			r.pend = r.pend[n:]
@@ -147,6 +156,16 @@ func (r *resumingReader) Read(p []byte) (int, error) {
 		}
 		if r.err != nil {
 			return 0, r.err
+		}
+		if r.stash != nil {
+			// A transport error whose final bytes have now drained: resume
+			// at the advanced offset so no byte arrives twice.
+			err := r.stash
+			r.stash = nil
+			if !r.resume(fmt.Sprintf("read error: %v", err)) {
+				return 0, r.err
+			}
+			continue
 		}
 
 		timer := time.NewTimer(r.idle)
@@ -167,7 +186,16 @@ func (r *resumingReader) Read(p []byte) (int, error) {
 					return 0, io.EOF
 				}
 				// A mid-stream transport error is as resumable as a stall —
-				// same offset, same Range request.
+				// same offset, same Range request — but only once its bytes
+				// are delivered. The resume below reopens at r.off, which
+				// advances as the caller receives bytes; resuming now would
+				// replay r.pend from the reopened stream, delivering every
+				// byte twice and corrupting the layer. Stash the error and
+				// drain first.
+				if len(r.pend) > 0 {
+					r.stash = c.err
+					continue
+				}
 				if !r.resume(fmt.Sprintf("read error: %v", c.err)) {
 					return 0, r.err
 				}
@@ -220,6 +248,7 @@ func (r *resumingReader) resume(why string) bool {
 }
 
 func (r *resumingReader) Close() error {
+	r.closed = true
 	r.abandon()
 	return nil
 }

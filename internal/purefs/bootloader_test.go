@@ -224,3 +224,140 @@ func TestDetectBootChainHardlinkedSdBoot(t *testing.T) {
 		t.Fatalf("got %+v", bc)
 	}
 }
+
+// --- Exact platform UEFI boot chain (Task 4) ---
+
+// Each target architecture stages its own fallback loader and GRUB names;
+// x86_64/aarch64 shorthands fold to the canonical forms.
+func TestUEFIBootNamesPerArch(t *testing.T) {
+	cases := []struct {
+		arch     string
+		wantBoot string
+		wantGrub string
+		wantMok  string
+	}{
+		{"amd64", "BOOTX64.EFI", "grubx64.efi", "mmx64.efi"},
+		{"x86_64", "BOOTX64.EFI", "grubx64.efi", "mmx64.efi"},
+		{"arm64", "BOOTAA64.EFI", "grubaa64.efi", "mmaa64.efi"},
+		{"aarch64", "BOOTAA64.EFI", "grubaa64.efi", "mmaa64.efi"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.arch, func(t *testing.T) {
+			boot, grub, err := UEFIBootNames(tc.arch)
+			if err != nil {
+				t.Fatalf("UEFIBootNames(%q): %v", tc.arch, err)
+			}
+			if boot != tc.wantBoot || grub != tc.wantGrub {
+				t.Errorf("got %s/%s, want %s/%s", boot, grub, tc.wantBoot, tc.wantGrub)
+			}
+			mok, err := UEFIMokName(tc.arch)
+			if err != nil {
+				t.Fatalf("UEFIMokName(%q): %v", tc.arch, err)
+			}
+			if mok != tc.wantMok {
+				t.Errorf("mok = %s, want %s", mok, tc.wantMok)
+			}
+		})
+	}
+	if _, _, err := UEFIBootNames("riscv64"); err == nil {
+		t.Error("unknown architecture must fail closed, got nil")
+	}
+	if _, err := UEFIMokName("riscv64"); err == nil {
+		t.Error("unknown MOK architecture must fail closed, got nil")
+	}
+}
+
+// A tree carrying both payloads resolves the chain matching the requested
+// architecture — never whichever probes first.
+func TestDetectBootChainForArchSelectsMatchingPayload(t *testing.T) {
+	root := bootTree(t,
+		"usr/lib/bootupd/updates/EFI/fedora/shimx64.efi",
+		"usr/lib/bootupd/updates/EFI/fedora/grubx64.efi",
+		"usr/lib/bootupd/updates/EFI/fedora/shimaa64.efi",
+		"usr/lib/bootupd/updates/EFI/fedora/grubaa64.efi",
+	)
+	x64, err := DetectBootChainForArch(root, "x86_64")
+	if err != nil {
+		t.Fatalf("x86_64: %v", err)
+	}
+	if x64.Kind != "grub2" || !strings.HasSuffix(x64.Shim, "shimx64.efi") || !strings.HasSuffix(x64.Grub, "grubx64.efi") {
+		t.Fatalf("x86_64 resolved the wrong payload: %+v", x64)
+	}
+	aa64, err := DetectBootChainForArch(root, "aarch64")
+	if err != nil {
+		t.Fatalf("aarch64: %v", err)
+	}
+	if aa64.Kind != "grub2" || !strings.HasSuffix(aa64.Shim, "shimaa64.efi") || !strings.HasSuffix(aa64.Grub, "grubaa64.efi") {
+		t.Fatalf("aarch64 resolved the wrong payload: %+v", aa64)
+	}
+}
+
+// systemd-boot detection is per-arch too: an arm64-only PE never satisfies
+// an x86_64 request.
+func TestDetectBootChainForArchSdBootPerArch(t *testing.T) {
+	root := bootTree(t, "usr/lib/systemd/boot/efi/systemd-bootaa64.efi")
+	bc, err := DetectBootChainForArch(root, "arm64")
+	if err != nil {
+		t.Fatalf("arm64: %v", err)
+	}
+	if bc.Kind != "sdboot" {
+		t.Fatalf("got %+v", bc)
+	}
+	if _, err := DetectBootChainForArch(root, "amd64"); err == nil {
+		t.Fatal("an arm64-only tree must not satisfy an amd64 boot probe")
+	}
+}
+
+// A tree with only x86_64 payloads must never satisfy an ARM64 request —
+// no cross-architecture substitution.
+func TestDetectBootChainForArchNoCrossSubstitution(t *testing.T) {
+	root := bootTree(t,
+		"usr/lib/systemd/boot/efi/systemd-bootx64.efi",
+		"usr/lib/bootupd/updates/EFI/fedora/shimx64.efi",
+		"usr/lib/bootupd/updates/EFI/fedora/grubx64.efi",
+	)
+	if _, err := DetectBootChainForArch(root, "arm64"); err == nil {
+		t.Fatal("an x86_64-only tree must not satisfy an arm64 boot probe")
+	}
+	if _, err := DetectBootChainForArch(root, "riscv64"); err == nil {
+		t.Fatal("an unknown architecture must fail closed")
+	}
+}
+
+// RequireUEFIBootChain is the fail-closed gate: a target image lacking the
+// matching EFI binaries is refused with the arch-correct staged name.
+func TestRequireUEFIBootChain(t *testing.T) {
+	x64Only := bootTree(t,
+		"usr/lib/bootupd/updates/EFI/fedora/shimx64.efi",
+		"usr/lib/bootupd/updates/EFI/fedora/grubx64.efi",
+	)
+	if _, err := RequireUEFIBootChain(x64Only, "x86_64"); err != nil {
+		t.Errorf("x86_64 with its payload present should pass: %v", err)
+	}
+	_, err := RequireUEFIBootChain(x64Only, "aarch64")
+	if err == nil {
+		t.Fatal("expected refusal for aarch64 against an x86_64-only image")
+	}
+	if !strings.Contains(err.Error(), "BOOTAA64.EFI") {
+		t.Errorf("refusal must name the staged fallback loader, got: %v", err)
+	}
+
+	aa64Only := bootTree(t,
+		"usr/lib/bootupd/updates/EFI/fedora/shimaa64.efi",
+		"usr/lib/bootupd/updates/EFI/fedora/grubaa64.efi",
+	)
+	if _, err := RequireUEFIBootChain(aa64Only, "arm64"); err != nil {
+		t.Errorf("arm64 with its payload present should pass: %v", err)
+	}
+	if _, err := RequireUEFIBootChain(aa64Only, "amd64"); err == nil {
+		t.Fatal("expected refusal for amd64 against an arm64-only image")
+	}
+
+	empty := bootTree(t, "usr/lib/os-release")
+	if _, err := RequireUEFIBootChain(empty, "amd64"); err == nil {
+		t.Fatal("expected refusal for an image with no EFI binaries")
+	}
+	if _, err := RequireUEFIBootChain(x64Only, "riscv64"); err == nil {
+		t.Fatal("expected refusal for an unknown architecture")
+	}
+}
