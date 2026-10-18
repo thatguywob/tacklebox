@@ -118,9 +118,25 @@ func buildDdiIso(_ js.Value, args []js.Value) any {
 		entry := fmt.Sprintf("title %s %s (live)\nlinux %s\ninitrd %s\noptions %s\n",
 			label, rel.Version, kernelPath, initrdPath, kargs)
 
+		// The DDI artifact set ships no loader of its own, so the ESP
+		// fallback filename follows the requested platform (opts.platform,
+		// default amd64) rather than a hardcoded BOOTX64.EFI.
+		ddiPlatform := "amd64"
+		if v := opts.Get("platform"); v.Type() == js.TypeString && strings.TrimSpace(v.String()) != "" {
+			ddiPlatform = strings.TrimSpace(v.String())
+		}
+		ddiArch, err := purefs.EffectivePlatformArch(ddiPlatform)
+		if err != nil {
+			return nil, err
+		}
+		ddiBootName, _, err := purefs.UEFIBootNames(ddiArch)
+		if err != nil {
+			return nil, err
+		}
+
 		emitProgress("esp", 0, 1)
 		esp, err := purefs.BuildEspBytes([]purefs.EspFile{
-			{Path: "/EFI/BOOT/BOOTX64.EFI", Source: bytesSource(sdboot)},
+			{Path: "/EFI/BOOT/" + ddiBootName, Source: bytesSource(sdboot)},
 			{Path: "/loader/loader.conf", Source: purefs.StringSource("timeout 3\n")},
 			{Path: "/loader/entries/" + envID + ".conf", Source: purefs.StringSource(entry)},
 			{Path: kernelPath, Source: bytesSource(sections.Linux)},
@@ -135,7 +151,7 @@ func buildDdiIso(_ js.Value, args []js.Value) any {
 		jw := &jsChunkWriter{cb: onChunk}
 		inputs := []purefs.IsoInput{
 			{Path: "/EFI/efi.img", Size: int64(len(esp)), Source: bytesSource(esp)},
-			{Path: "/EFI/BOOT/BOOTX64.EFI", Size: int64(len(sdboot)), Source: bytesSource(sdboot)},
+			{Path: "/EFI/BOOT/" + ddiBootName, Size: int64(len(sdboot)), Source: bytesSource(sdboot)},
 			{Path: kernelPath, Size: int64(len(sections.Linux)), Source: bytesSource(sections.Linux)},
 			{Path: initrdPath, Size: int64(len(initrd)), Source: bytesSource(initrd)},
 			{Path: "/LiveOS/" + sfsName, Size: sfsSize, Source: sfsSource},

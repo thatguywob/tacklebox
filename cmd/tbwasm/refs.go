@@ -4,7 +4,25 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/tuna-os/tacklebox/internal/purefs"
 )
+
+type (
+	BuildRequest   = purefs.BuildRequest
+	TargetIdentity = purefs.TargetIdentity
+	ResolvedInputs = purefs.ResolvedInputs
+	BuildOptions   = purefs.BuildOptions
+	SinkWriter     = purefs.SinkWriter
+)
+
+func ParseBuildRequest(data []byte) (*BuildRequest, error) {
+	return purefs.ParseBuildRequest(data)
+}
+
+func NewSinkWriter(sink func(chunk []byte) error) *SinkWriter {
+	return purefs.NewSinkWriter(sink)
+}
 
 // splitRef splits an <repo>:<tag> image reference on the last colon that
 // precedes any slash, so a registry:port prefix in repo (e.g.

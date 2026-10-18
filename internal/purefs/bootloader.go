@@ -45,11 +45,62 @@ type BootChain struct {
 	// every candidate for the same reason).
 	Vendor string
 }
+// sdBootCandidatesFor lists the systemd-boot PE probes in preference order
+// for one architecture — see the Debian note on BootChain.SdBoot. (Debian
+// ships only the .signed name, an sbat-signed PE that boots unchanged.)
+func sdBootCandidatesFor(arch string) []string {
+	pe := "usr/lib/systemd/boot/efi/systemd-boot" + efiArchSuffix(arch) + ".efi"
+	return []string{pe, pe + ".signed"}
+}
+// UEFIBootNames maps an OCI architecture to the arch-correct UEFI fallback
+// loader and GRUB binary basenames staged under /EFI/BOOT:
+// amd64 -> BOOTX64.EFI/grubx64.efi, arm64 -> BOOTAA64.EFI/grubaa64.efi.
+// Unknown architectures fail closed so a build never stages an EFI binary
+// the target firmware will not execute.
+func UEFIBootNames(arch string) (bootLoaderName, grubName string, err error) {
+	switch normalizeArch(arch) {
+	case "amd64":
+		return "BOOTX64.EFI", "grubx64.efi", nil
+	case "arm64":
+		return "BOOTAA64.EFI", "grubaa64.efi", nil
+	default:
+		return "", "", fmt.Errorf("unsupported architecture %q for UEFI boot names (want amd64 or arm64)", arch)
+	}
+}
 
-// sdBootCandidates in preference order — see the Debian note above.
-var sdBootCandidates = []string{
-	"usr/lib/systemd/boot/efi/systemd-bootx64.efi",
-	"usr/lib/systemd/boot/efi/systemd-bootx64.efi.signed",
+// UEFIMokName maps an OCI architecture to its MOK manager binary basename
+// (mmx64.efi / mmaa64.efi), staged alongside the fallback loader when the
+// image payload carries one.
+func UEFIMokName(arch string) (string, error) {
+	switch normalizeArch(arch) {
+	case "amd64":
+		return "mmx64.efi", nil
+	case "arm64":
+		return "mmaa64.efi", nil
+	default:
+		return "", fmt.Errorf("unsupported architecture %q for UEFI MOK manager name (want amd64 or arm64)", arch)
+	}
+}
+
+// normalizeArch folds arch shorthands to their OCI canonical form.
+func normalizeArch(arch string) string {
+	switch strings.ToLower(strings.TrimSpace(arch)) {
+	case "x86_64", "amd64":
+		return "amd64"
+	case "aarch64", "arm64":
+		return "arm64"
+	default:
+		return strings.ToLower(strings.TrimSpace(arch))
+	}
+}
+
+// efiArchSuffix is the filename infix the boot payloads carry per
+// architecture ("shimx64.efi" vs "shimaa64.efi", ...).
+func efiArchSuffix(arch string) string {
+	if normalizeArch(arch) == "arm64" {
+		return "aa64"
+	}
+	return "x64"
 }
 
 // DetectBootChain resolves which loader the live ISO will boot through.
@@ -57,12 +108,37 @@ var sdBootCandidates = []string{
 // systemd-boot wins when both are present: it is the proven path for
 // every image that built before this detection existed, so adding the
 // GRUB path cannot change any previously-working build.
+//
+// Arch-agnostic entry point: it probes the amd64 payload names first
+// (preserving every previously-working result) and falls back to the
+// arm64 names. Builds targeting a specific platform MUST use
+// DetectBootChainForArch so a multi-arch tree resolves the payload
+// matching the requested architecture instead of whichever probes first.
 func DetectBootChain(root *oci.Node) (*BootChain, error) {
-	for _, p := range sdBootCandidates {
+	if bc, err := DetectBootChainForArch(root, "amd64"); err == nil {
+		return bc, nil
+	}
+	return DetectBootChainForArch(root, "arm64")
+}
+
+// DetectBootChainForArch resolves the boot chain from the payload binaries
+// matching arch only (amd64 probes the *x64 names, arm64 the *aa64 names).
+// An unknown architecture fails closed via UEFIBootNames.
+func DetectBootChainForArch(root *oci.Node, arch string) (*BootChain, error) {
+	if _, _, err := UEFIBootNames(arch); err != nil {
+		return nil, err
+	}
+	suf := efiArchSuffix(arch)
+	sdPE := "usr/lib/systemd/boot/efi/systemd-boot" + suf + ".efi"
+	for _, p := range sdBootCandidatesFor(arch) {
 		if rp, n := resolveFile(root, p); n != nil {
 			return &BootChain{Kind: "sdboot", SdBoot: rp}, nil
 		}
 	}
+
+	shimName := "shim" + suf + ".efi"
+	grubName := "grub" + suf + ".efi"
+	mokName := "mm" + suf + ".efi"
 
 	// bootupd's older layout (and ostree-boot): one vendor directory
 	// holding the whole signed set.
@@ -79,11 +155,11 @@ func DetectBootChain(root *oci.Node) (*BootChain, error) {
 			if vd == nil || vd.Type != oci.TypeDir {
 				continue
 			}
-			shim, sn := resolveFile(root, base+"/"+vendor+"/shimx64.efi")
-			grub, gn := resolveFile(root, base+"/"+vendor+"/grubx64.efi")
+			shim, sn := resolveFile(root, base+"/"+vendor+"/"+shimName)
+			grub, gn := resolveFile(root, base+"/"+vendor+"/"+grubName)
 			if sn != nil && gn != nil {
 				bc := &BootChain{Kind: "grub2", Shim: shim, Grub: grub, Vendor: vendor}
-				bc.MokMgr, _ = resolveFile(root, base+"/"+vendor+"/mmx64.efi")
+				bc.MokMgr, _ = resolveFile(root, base+"/"+vendor+"/"+mokName)
 				return bc, nil
 			}
 		}
@@ -94,14 +170,14 @@ func DetectBootChain(root *oci.Node) (*BootChain, error) {
 	// into a coherent pair by vendor directory (only EFI.json remains
 	// under bootupd/updates). Vendor comes from the MATCHED location;
 	// the stored paths are hardlink-resolved (see resolveFile).
-	if grub := findFirst(root, "usr/lib/efi/grub2", "grubx64.efi", ""); grub != "" {
+	if grub := findFirst(root, "usr/lib/efi/grub2", grubName, ""); grub != "" {
 		vendor := path.Base(path.Dir(grub))
-		if shim := findFirst(root, "usr/lib/efi/shim", "shimx64.efi", "EFI/"+vendor+"/shimx64.efi"); shim != "" {
+		if shim := findFirst(root, "usr/lib/efi/shim", shimName, "EFI/"+vendor+"/"+shimName); shim != "" {
 			grubR, gn := resolveFile(root, grub)
 			shimR, sn := resolveFile(root, shim)
 			if gn != nil && sn != nil {
 				bc := &BootChain{Kind: "grub2", Shim: shimR, Grub: grubR, Vendor: vendor}
-				if mm := findFirst(root, "usr/lib/efi/shim", "mmx64.efi", "EFI/"+vendor+"/mmx64.efi"); mm != "" {
+				if mm := findFirst(root, "usr/lib/efi/shim", mokName, "EFI/"+vendor+"/"+mokName); mm != "" {
 					bc.MokMgr, _ = resolveFile(root, mm)
 				}
 				return bc, nil
@@ -110,8 +186,24 @@ func DetectBootChain(root *oci.Node) (*BootChain, error) {
 	}
 
 	return nil, fmt.Errorf(
-		"image ships no bootable EFI loader: no systemd-boot at usr/lib/systemd/boot/efi/systemd-bootx64.efi[.signed] " +
-			"and no bootupd shim+GRUB pair under usr/lib/bootupd/updates/EFI, usr/lib/ostree-boot/efi/EFI or usr/lib/efi/{shim,grub2}")
+		"image ships no bootable %s EFI loader: no systemd-boot at "+sdPE+"[.signed] "+
+			"and no bootupd "+shimName+"+"+grubName+" pair under usr/lib/bootupd/updates/EFI, usr/lib/ostree-boot/efi/EFI or usr/lib/efi/{shim,grub2}", arch)
+}
+
+// RequireUEFIBootChain resolves the arch-matching boot chain and errors
+// with the specific blocker reason when the target architecture's EFI
+// binaries are absent — the fail-closed gate for per-platform ISO assembly.
+func RequireUEFIBootChain(root *oci.Node, arch string) (*BootChain, error) {
+	bootName, _, err := UEFIBootNames(arch)
+	if err != nil {
+		return nil, err
+	}
+	chain, err := DetectBootChainForArch(root, arch)
+	if err != nil {
+		return nil, fmt.Errorf("no %s UEFI boot chain: image must ship %s-capable EFI binaries (staged as %s under /EFI/BOOT): %w",
+			arch, arch, bootName, err)
+	}
+	return chain, nil
 }
 
 // LiveGrubCfg renders the grub.cfg for the grub2 chain — the same single

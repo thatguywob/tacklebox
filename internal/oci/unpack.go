@@ -79,6 +79,15 @@ func (c *Client) Unpack(ref Ref, m *Manifest, store BlobStore, progress func(lay
 		if err != nil {
 			return nil, fmt.Errorf("layer %d: %w", i, err)
 		}
+		if c.RetainLayer != nil {
+			retained, rerr := c.RetainLayer(layer, body)
+			if rerr != nil {
+				body.Close()
+				pipe.close()
+				return nil, fmt.Errorf("layer %d: %w", i, rerr)
+			}
+			body = retained
+		}
 		if err := applyLayerFiltered(root, body, layer.MediaType, store, c.SkipBodies); err != nil {
 			body.Close()
 			return nil, fmt.Errorf("layer %d: %w", i, err)

@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,6 +31,19 @@ type Client struct {
 	// SkipBodies drops file bodies of matching paths during Unpack —
 	// boot-irrelevant junk (tmp/, caches) never reaches the blob store.
 	SkipBodies func(path string) bool
+	// RetainLayer, when non-nil, takes ownership of each layer body Unpack
+	// downloads, before it is applied: it must consume body fully, retain
+	// the verified compressed bytes under d.Digest, and return a fresh
+	// reader over the retained bytes for the applier to consume. The hook
+	// must itself Close the original body and propagate a digest-mismatch
+	// Close error as a return error, so a corrupt layer aborts the unpack
+	// instead of being applied. Unpack Closes the returned reader.
+	//
+	// Nil by default (no retention). Callers set it only around the
+	// base-image Unpack whose compressed layers belong in installable
+	// media; overlay deltas applied via UnpackOnto must never be retained
+	// into an installable layout.
+	RetainLayer func(d Descriptor, body io.ReadCloser) (io.ReadCloser, error)
 
 	// FetchAhead is how many layer downloads may be in flight ahead of the one
 	// being applied. Layers are still APPLIED strictly in order (overlay
@@ -99,6 +113,10 @@ type Manifest struct {
 	Manifests []Descriptor `json:"manifests,omitempty"` // index form
 	Config    Descriptor   `json:"config"`
 	Layers    []Descriptor `json:"layers,omitempty"`
+	// Annotations carries the OCI image annotations (e.g. the
+	// org.tunaos.live-overlay.* pins a live-overlay publisher stamps on
+	// its platform manifest). Absent on older manifests.
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 const acceptManifest = "application/vnd.oci.image.index.v1+json, " +
@@ -273,8 +291,13 @@ func (c *Client) headerTimeout() time.Duration {
 }
 
 // ResolveManifest fetches ref's manifest, following one level of index
-// indirection to the requested architecture (bare arch, no variant —
-// matching the CI build matrix's published_tag layout).
+// indirection to the requested architecture.
+//
+// Legacy/arch-only entry point: it matches on bare architecture with no
+// variant handling and silently falls back to Manifests[0] when nothing
+// matches. Preserved so existing callers and tests keep compiling; new
+// code MUST use ResolveManifestForPlatform, which selects the exact
+// requested platform and fails closed instead of falling back.
 func (c *Client) ResolveManifest(ref Ref, arch string) (*Manifest, error) {
 	resp, err := c.get(ref.Repo, "manifests/"+ref.Tag, acceptManifest)
 	if err != nil {
@@ -324,6 +347,179 @@ func (c *Client) ResolveManifest(ref Ref, arch string) (*Manifest, error) {
 		return nil, fmt.Errorf("platform manifest decode: %w", err)
 	}
 	return &pm, nil
+}
+
+// ErrPlatformNotFound is returned (wrapped in *PlatformNotFoundError) when a
+// manifest index contains no descriptor for the requested platform.
+var ErrPlatformNotFound = errors.New("platform not found in manifest index")
+
+// PlatformNotFoundError names the requested platform and the descriptor
+// architectures the index actually publishes, so callers can assert the
+// failure without matching error text.
+type PlatformNotFoundError struct {
+	Platform  string
+	Available []string
+}
+
+func (e *PlatformNotFoundError) Error() string {
+	return fmt.Sprintf("platform %q not found in manifest index (available: %s)",
+		e.Platform, strings.Join(e.Available, ", "))
+}
+
+func (e *PlatformNotFoundError) Unwrap() error { return ErrPlatformNotFound }
+
+// ErrManifestDigestMismatch is returned (wrapped in
+// *ManifestDigestMismatchError) when a fetched platform manifest does not
+// hash to its descriptor digest, or when the descriptor digest differs from
+// an expected (pinned) digest.
+var ErrManifestDigestMismatch = errors.New("manifest digest mismatch")
+
+// ManifestDigestMismatchError carries both sides of a platform-manifest
+// digest comparison so callers can assert the failure without matching
+// error text.
+type ManifestDigestMismatchError struct {
+	Want string
+	Got  string
+}
+
+func (e *ManifestDigestMismatchError) Error() string {
+	return fmt.Sprintf("platform manifest digest mismatch: got %s want %s", e.Got, e.Want)
+}
+
+func (e *ManifestDigestMismatchError) Unwrap() error { return ErrManifestDigestMismatch }
+
+// parsePlatformRequest validates a canonical platform or OCI architecture
+// string and returns its OCI architecture ("amd64" or "arm64") and optional
+// CPU variant. It mirrors purefs.ParsePlatform (which this package cannot
+// import without a cycle); the two MUST stay in lockstep.
+func parsePlatformRequest(platform string) (arch, variant string, err error) {
+	switch strings.TrimSpace(platform) {
+	case "linux/amd64", "amd64", "x86_64":
+		return "amd64", "", nil
+	case "linux/amd64/v2":
+		return "amd64", "v2", nil
+	case "linux/arm64", "linux/arm64/v8", "arm64", "aarch64":
+		return "arm64", "", nil
+	default:
+		return "", "", fmt.Errorf("unsupported platform %q (valid: linux/amd64, linux/amd64/v2, linux/arm64)", platform)
+	}
+}
+
+// matchPlatformDescriptor selects the index descriptor for the exact
+// requested architecture/variant: the architecture must match, and for
+// linux/amd64/v2 only a descriptor with variant == "v2" satisfies (never a
+// variantless amd64 entry); for arm64, variant "" or "v8" satisfies. There
+// is deliberately no fallback — a missing platform is an error, never a
+// silent Manifests[0].
+func matchPlatformDescriptor(manifests []Descriptor, arch, variant string) *Descriptor {
+	for i := range manifests {
+		d := &manifests[i]
+		if d.Platform == nil || d.Platform.Architecture != arch {
+			continue
+		}
+		if arch == "arm64" {
+			if d.Platform.Variant == "" || d.Platform.Variant == "v8" {
+				return d
+			}
+			continue
+		}
+		if d.Platform.Variant == variant {
+			return d
+		}
+	}
+	return nil
+}
+
+// describeAvailablePlatforms renders each indexed descriptor's architecture
+// (plus variant when present) for PlatformNotFoundError.
+func describeAvailablePlatforms(manifests []Descriptor) []string {
+	var out []string
+	for _, d := range manifests {
+		if d.Platform == nil {
+			continue
+		}
+		s := d.Platform.Architecture
+		if d.Platform.Variant != "" {
+			s += "/" + d.Platform.Variant
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// ResolveManifestForPlatform fetches ref's manifest, following one level of
+// index indirection to the EXACT requested platform ("linux/amd64",
+// "linux/amd64/v2", "linux/arm64", plus the "amd64"/"arm64" shorthands).
+// It returns the decoded platform manifest and that platform manifest's
+// digest (the matching index descriptor's digest, verified against the
+// fetched bytes; for a single-manifest ref, the digest of the body itself).
+//
+// Unlike the legacy ResolveManifest it never falls back: an index with no
+// matching descriptor yields a *PlatformNotFoundError naming the requested
+// platform and the available descriptor architectures.
+func (c *Client) ResolveManifestForPlatform(ref Ref, platform string) (*Manifest, string, error) {
+	return c.ResolveManifestForPlatformWithDigest(ref, platform, "")
+}
+
+// ResolveManifestForPlatformWithDigest is ResolveManifestForPlatform with an
+// optional expected platform-manifest digest: when non-empty and different
+// from the picked descriptor's digest it returns a
+// *ManifestDigestMismatchError without fetching the manifest. The platform
+// digest and any index digest MUST NOT be conflated — the comparison is
+// always against the matching descriptor's digest.
+func (c *Client) ResolveManifestForPlatformWithDigest(ref Ref, platform, expectedDigest string) (*Manifest, string, error) {
+	want := strings.TrimSpace(platform)
+	if want == "" {
+		want = "amd64"
+	}
+	wantArch, wantVar, err := parsePlatformRequest(want)
+	if err != nil {
+		return nil, "", err
+	}
+	resp, err := c.get(ref.Repo, "manifests/"+ref.Tag, acceptManifest)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("manifest read: %w", err)
+	}
+	var m Manifest
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, "", fmt.Errorf("manifest decode: %w", err)
+	}
+	if len(m.Manifests) == 0 {
+		sum := sha256.Sum256(body)
+		return &m, "sha256:" + hex.EncodeToString(sum[:]), nil
+	}
+	pick := matchPlatformDescriptor(m.Manifests, wantArch, wantVar)
+	if pick == nil {
+		return nil, "", &PlatformNotFoundError{Platform: want, Available: describeAvailablePlatforms(m.Manifests)}
+	}
+	if want := strings.TrimSpace(expectedDigest); want != "" && pick.Digest != want {
+		return nil, "", &ManifestDigestMismatchError{Want: want, Got: pick.Digest}
+	}
+	resp2, err := c.get(ref.Repo, "manifests/"+pick.Digest, acceptManifest)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp2.Body.Close()
+	// Same substitution check as the legacy path (see ResolveManifest): the
+	// platform manifest is asked for BY digest, so the bytes must hash to it.
+	body2, err := io.ReadAll(resp2.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("platform manifest read: %w", err)
+	}
+	sum := sha256.Sum256(body2)
+	if got := "sha256:" + hex.EncodeToString(sum[:]); got != pick.Digest {
+		return nil, "", &ManifestDigestMismatchError{Want: pick.Digest, Got: got}
+	}
+	var pm Manifest
+	if err := json.Unmarshal(body2, &pm); err != nil {
+		return nil, "", fmt.Errorf("platform manifest decode: %w", err)
+	}
+	return &pm, pick.Digest, nil
 }
 
 // Blob streams a blob while verifying its digest: the returned reader

@@ -202,3 +202,235 @@ func TestResumeRejectsRangeIgnoringRegistry(t *testing.T) {
 		t.Fatalf("want explicit resume-unsupported error, got %v", err)
 	}
 }
+
+// Recorded-stall reproduction: mirrors local://iso-builder-baseline.json,
+// where a layer went quiet at byte 12582912 (12 MiB). The reader must either
+// recover via a byte-exact Range resume (opens == [0, 12582912]) or fail with
+// ErrStalled carrying the stalled offset — never hang, never duplicate bytes.
+func TestResumingReaderRecoversAt12582912(t *testing.T) {
+	const stallAt = 12582912
+	const tail = 4096
+	data := make([]byte, stallAt+tail)
+	for i := range data {
+		data[i] = byte((i * 31) % 251)
+	}
+
+	var mu sync.Mutex
+	var opens []int64
+	open := func(offset int64) (io.ReadCloser, error) {
+		mu.Lock()
+		opens = append(opens, offset)
+		mu.Unlock()
+		if offset == 0 {
+			return newStallingBody(data, stallAt), nil
+		}
+		return io.NopCloser(bytes.NewReader(data[offset:])), nil
+	}
+
+	r, err := newResumingReader(open, 50*time.Millisecond, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		got []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		got, err := io.ReadAll(r)
+		done <- result{got, err}
+	}()
+	select {
+	case res := <-done:
+		if res.err != nil {
+			if !errors.Is(res.err, ErrStalled) {
+				t.Fatalf("read: %v", res.err)
+			}
+			if !strings.Contains(res.err.Error(), "12582912") {
+				t.Fatalf("ErrStalled must carry stalled offset, got: %v", res.err)
+			}
+			return
+		}
+		if !bytes.Equal(res.got, data) {
+			t.Fatalf("content mismatch: got %d bytes, want %d", len(res.got), len(data))
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(opens) != 2 || opens[0] != 0 || opens[1] != stallAt {
+			t.Fatalf("expected byte-exact resume opens=[0 %d], got %v", stallAt, opens)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("reader hung: neither recovered nor returned ErrStalled")
+	}
+}
+
+// Data+error chunk: a body delivering final bytes together with a transport
+// error. The stashed bytes must drain first and the resume must start after
+// them, so no byte arrives twice and the stream still verifies.
+func TestResumingReaderDataPlusErrorChunk(t *testing.T) {
+	payload := bytes.Repeat([]byte("layer-bytes-0123456789"), 4000) // ~84 KB
+	sum := sha256.Sum256(payload)
+	want := "sha256:" + hex.EncodeToString(sum[:])
+	const firstGood = 50000
+	boom := errors.New("connection reset by peer")
+
+	type flakyBody struct {
+		data []byte
+		off  int
+		sent bool
+	}
+	open := func(offset int64) (io.ReadCloser, error) {
+		if offset == 0 {
+			b := &flakyBody{data: payload}
+			return readCloserFunc{
+				read: func(p []byte) (int, error) {
+					if b.off < firstGood {
+						n := copy(p, b.data[b.off:firstGood])
+						b.off += n
+						if b.off >= firstGood && !b.sent {
+							b.sent = true
+							return n, boom
+						}
+						return n, nil
+					}
+					return 0, boom
+				},
+				close: func() error { return nil },
+			}, nil
+		}
+		return io.NopCloser(bytes.NewReader(payload[offset:])), nil
+	}
+
+	r, err := newResumingReader(open, 50*time.Millisecond, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vr := &verifyingReader{body: r, want: want, hash: sha256.New()}
+	got, err := io.ReadAll(vr)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("duplication/corruption after data+error resume: got %d bytes want %d", len(got), len(payload))
+	}
+	if err := vr.Close(); err != nil {
+		t.Fatalf("digest check failed after data+error resume: %v", err)
+	}
+}
+
+type readCloserFunc struct {
+	read  func([]byte) (int, error)
+	close func() error
+}
+
+func (f readCloserFunc) Read(p []byte) (int, error) { return f.read(p) }
+func (f readCloserFunc) Close() error {
+	if f.close != nil {
+		return f.close()
+	}
+	return nil
+}
+
+// Truncated stream: ends early with the wrong sha256. Close must report a
+// digest mismatch, so partial bytes are never mistaken for a complete layer.
+func TestVerifyingReaderRejectsTruncatedStream(t *testing.T) {
+	full := bytes.Repeat([]byte("complete-layer-"), 5000)
+	sum := sha256.Sum256(full)
+	want := "sha256:" + hex.EncodeToString(sum[:])
+	truncated := full[:len(full)/3]
+
+	vr := &verifyingReader{body: io.NopCloser(bytes.NewReader(truncated)), want: want, hash: sha256.New()}
+	got, err := io.ReadAll(vr)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, truncated) {
+		t.Fatalf("expected partial %d bytes, got %d", len(truncated), len(got))
+	}
+	err = vr.Close()
+	if err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+		t.Fatalf("want digest mismatch on truncated stream, got %v", err)
+	}
+}
+
+// Zero-byte trailing chunk: a (0, nil) read followed by EOF must not corrupt
+// the stream or wedge the pump — the digest still verifies.
+func TestResumingReaderToleratesZeroByteChunk(t *testing.T) {
+	payload := bytes.Repeat([]byte("zero-chunk-"), 3000)
+	sum := sha256.Sum256(payload)
+	want := "sha256:" + hex.EncodeToString(sum[:])
+
+	calls := 0
+	off := 0
+	open := func(offset int64) (io.ReadCloser, error) {
+		if offset != 0 {
+			return io.NopCloser(bytes.NewReader(payload[offset:])), nil
+		}
+		return readCloserFunc{
+			read: func(p []byte) (int, error) {
+				calls++
+				if calls == 1 {
+					return 0, nil // zero-byte trailing-style chunk
+				}
+				if off >= len(payload) {
+					return 0, io.EOF
+				}
+				n := copy(p, payload[off:])
+				off += n
+				return n, nil
+			},
+			close: func() error { return nil },
+		}, nil
+	}
+	r, err := newResumingReader(open, time.Second, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vr := &verifyingReader{body: r, want: want, hash: sha256.New()}
+	got, err := io.ReadAll(vr)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("content mismatch after zero-byte chunk: got %d want %d", len(got), len(payload))
+	}
+	if err := vr.Close(); err != nil {
+		t.Fatalf("digest check failed: %v", err)
+	}
+}
+
+// Reads after Close must fail fast with errReaderClosed and never trigger a
+// fresh Range reopen (no reopen storm on a discarded stream).
+func TestResumingReaderReadsAfterCloseFailFast(t *testing.T) {
+	data := bytes.Repeat([]byte("abcd"), 10000)
+	var mu sync.Mutex
+	opens := 0
+	open := func(offset int64) (io.ReadCloser, error) {
+		mu.Lock()
+		opens++
+		mu.Unlock()
+		return io.NopCloser(bytes.NewReader(data[offset:])), nil
+	}
+	r, err := newResumingReader(open, time.Second, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	for i := range 5 {
+		n, err := r.Read(make([]byte, 1024))
+		if n != 0 || !errors.Is(err, errReaderClosed) {
+			t.Fatalf("read %d after Close: got n=%d err=%v, want errReaderClosed", i, n, err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("reads after Close too slow: %v", elapsed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if opens != 1 {
+		t.Fatalf("Reads after Close reopened the stream: opens=%d, want 1", opens)
+	}
+}

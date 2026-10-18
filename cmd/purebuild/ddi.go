@@ -28,6 +28,10 @@ import (
 // SHA256SUMS) or a local directory laid out the same way — the local
 // form is what CI uses to e2e this path offline.
 func buildFromDdi(src, stem, label, workdir, out string) {
+	buildFromDdiForPlatform(src, stem, label, workdir, out, "amd64")
+}
+
+func buildFromDdiForPlatform(src, stem, label, workdir, out, platform string) {
 	if err := os.MkdirAll(workdir, 0o755); err != nil {
 		log.Fatal(err)
 	}
@@ -73,7 +77,21 @@ func buildFromDdi(src, stem, label, workdir, out string) {
 
 	// No image tree, so no image-shipped loader: the host's systemd-boot
 	// drives the extracted kernel/initrd via a BLS entry with live kargs.
+	// Both the host PE probe and the ESP fallback filename follow the
+	// requested platform (default amd64) — an arm64 DDI build stages
+	// BOOTAA64.EFI, never a hardcoded BOOTX64.EFI.
+	arch, err := purefs.EffectivePlatformArch(platform)
+	if err != nil {
+		log.Fatal(err)
+	}
+	bootName, _, err := purefs.UEFIBootNames(arch)
+	if err != nil {
+		log.Fatal(err)
+	}
 	sdBoot := "/usr/lib/systemd/boot/efi/systemd-bootx64.efi"
+	if arch == "arm64" {
+		sdBoot = "/usr/lib/systemd/boot/efi/systemd-bootaa64.efi"
+	}
 	if _, err := os.Stat(sdBoot); err != nil {
 		log.Fatal("DDI mode needs the host systemd-boot (install systemd-boot-efi): the artifact set ships only a UKI, whose baked cmdline cannot mount a live ISO root")
 	}
@@ -94,7 +112,7 @@ func buildFromDdi(src, stem, label, workdir, out string) {
 	log.Printf(">>> authoring ESP")
 	espPath := filepath.Join(workdir, "efi.img")
 	if err := purefs.WriteEsp(espPath, []purefs.EspFile{
-		{Path: "/EFI/BOOT/BOOTX64.EFI", Source: purefs.FileSource(sdBoot)},
+		{Path: "/EFI/BOOT/" + bootName, Source: purefs.FileSource(sdBoot)},
 		{Path: "/loader/loader.conf", Source: purefs.StringSource("timeout 3\n")},
 		{Path: "/loader/entries/" + envID + ".conf", Source: purefs.StringSource(entry)},
 		{Path: kernelPath, Source: kernelSrc},
@@ -110,7 +128,7 @@ func buildFromDdi(src, stem, label, workdir, out string) {
 	}
 	inputs := []purefs.IsoInput{
 		{Path: "/EFI/efi.img", Size: mustStatSize(espPath), Source: purefs.FileSource(espPath)},
-		{Path: "/EFI/BOOT/BOOTX64.EFI", Size: mustStatSize(sdBoot), Source: purefs.FileSource(sdBoot)},
+		{Path: "/EFI/BOOT/" + bootName, Size: mustStatSize(sdBoot), Source: purefs.FileSource(sdBoot)},
 		{Path: kernelPath, Size: int64(len(sections.Linux)), Source: kernelSrc},
 		{Path: initrdPath, Size: int64(len(initrd)), Source: initrdSrc},
 		{Path: "/LiveOS/" + sfsName, Size: mustStatSize(sfsPath), Source: purefs.FileSource(sfsPath)},
