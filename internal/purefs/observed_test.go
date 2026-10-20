@@ -94,8 +94,8 @@ func TestOverlayObservationAbsentAndZeroLayers(t *testing.T) {
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(response))}, nil
 	})}
 	applied, m, observed, err = GraftLiveOverlayObserved(root, nil, c, "tuna-os/yellowfin:kde", base, GraftOptions{})
-	if !applied || m == nil || err != nil || observed.ManifestDigest != observationDigest(body) || !observed.LayersApplied || observed.BaseAnnotationMatched {
-		t.Fatalf("zero-layer observation: %+v %v", observed, err)
+	if applied || m != nil || err == nil || observed != nil || !strings.Contains(err.Error(), "overlay added no layers") {
+		t.Fatalf("zero-layer overlay must retain existing rejection without evidence: %+v %v", observed, err)
 	}
 	_, _, observed, err = GraftLiveOverlayObserved(root, nil, c, "tuna-os/yellowfin:kde", base, GraftOptions{ExpectedOverlayDigest: "sha256:wrong"})
 	if err == nil || observed != nil {
