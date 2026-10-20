@@ -33,3 +33,21 @@ func TestMandatoryGateArguments(t *testing.T) {
 		}
 	}
 }
+
+func TestRejectFirmwareOverridesAndBootconfig(t *testing.T) {
+	for _, arg := range []string{
+		"firmware_class.path=/alternate", "firmware-class.path=/alternate", "firmware_class.path=", "firmware_class.path", "FIRMWARE_CLASS.path=/alternate",
+		"bootconfig", "bootconfig=/alternate", "bootconfig=0", "boot-config", "boot_config", "--", "quiet firmware_class.path=/alternate", "\"firmware_class.path=/alternate\"",
+	} {
+		t.Run(arg, func(t *testing.T) {
+			for _, args := range [][]string{{"tacklebox.x13s-adsp=required", arg}, {arg, "tacklebox.x13s-adsp=required"}} {
+				if err := ValidateArguments(args); err == nil {
+					t.Fatalf("accepted unsafe arguments %q", args)
+				}
+			}
+		})
+	}
+	if err := ValidateArguments([]string{"tacklebox.x13s-adsp=required", "quiet", "root=tbox:CDLABEL=TEST"}); err != nil {
+		t.Fatal(err)
+	}
+}

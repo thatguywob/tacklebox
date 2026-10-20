@@ -34,10 +34,14 @@ func ValidateScope(s Scope) error {
 }
 
 // ValidateArguments keeps the opt-in barrier mandatory and rejects driver
-// blacklist workarounds. This does not replace auditing the emitted initramfs.
+// blacklist workarounds, firmware path overrides and bootconfig. This does not
+// replace auditing the emitted initramfs and final boot command line.
 func ValidateArguments(args []string) error {
 	required := 0
 	for _, arg := range args {
+		if !safeWord(arg) || arg == "--" {
+			return fmt.Errorf("unsupported X13s kernel argument")
+		}
 		key, value, _ := strings.Cut(arg, "=")
 		if key == "tacklebox.x13s-adsp" {
 			if value != "required" {
@@ -45,7 +49,11 @@ func ValidateArguments(args []string) error {
 			}
 			required++
 		}
-		if strings.Contains(strings.ToLower(key), "blacklist") {
+		normalized := strings.ReplaceAll(strings.ToLower(key), "-", "_")
+		if normalized == "firmware_class.path" || strings.ReplaceAll(normalized, "_", "") == "bootconfig" {
+			return fmt.Errorf("firmware path overrides and bootconfig are unsupported in X13s mode")
+		}
+		if strings.Contains(normalized, "blacklist") {
 			return fmt.Errorf("driver blacklist arguments are unsupported in X13s mode")
 		}
 	}
