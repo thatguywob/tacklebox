@@ -50,6 +50,9 @@ func TestManifestObservationsUseConsumedBytes(t *testing.T) {
 			if m == nil || observed.ManifestDigest != digest || observed.Config.Descriptor.Digest != m.Config.Digest || observed.Config.BytesVerified {
 				t.Fatalf("bad observation %+v", observed)
 			}
+			if observed.RegistryEndpoint != "https://registry.invalid" || observed.Repository != "test/image" || observed.RequestedReference != "latest" {
+				t.Fatalf("request coordinates changed: %+v", observed)
+			}
 			if indexed {
 				if calls != 2 || observed.IndexDigest != observationDigest(index) || observed.PlatformDescriptor.Architecture != "amd64" || observed.PlatformDescriptor.Variant != "v2" {
 					t.Fatalf("bad index observation %+v", observed)
@@ -140,5 +143,66 @@ func TestOverlayApplyFailureHasNoObservation(t *testing.T) {
 	applied, m, observed, err := GraftLiveOverlayObserved(root, nil, c, "tuna-os/yellowfin:kde", &oci.Manifest{}, GraftOptions{})
 	if err == nil || applied || m != nil || observed != nil {
 		t.Fatalf("failed apply returned evidence: applied=%v manifest=%v observed=%+v err=%v", applied, m, observed, err)
+	}
+}
+
+func TestManifestObservationRequestCoordinatesAndRetry(t *testing.T) {
+	body := `{"schemaVersion":2,"layers":[]}`
+	digest := observationDigest(body)
+	c := oci.NewClient("https://registry.invalid:5443/proxy/")
+	c.HTTP = &http.Client{Transport: observationTransport(func(r *http.Request) (*http.Response, error) {
+		response := body
+		if r.URL.Path == "/proxy/token" {
+			response = `{"token":"fixture"}`
+		}
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(response))}, nil
+	})}
+	for _, ref := range []oci.Ref{{Repo: "team/image", Tag: "latest"}, {Repo: "other/image", Tag: "v1.2"}, {Repo: "team/image", Tag: digest}} {
+		_, observed, err := ResolveManifestObserved(c, ref, "amd64")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observed.Repository != ref.Repo || observed.RequestedReference != ref.Tag || observed.RegistryEndpoint != "https://registry.invalid:5443/proxy" || observed.ManifestDigest != digest {
+			t.Fatalf("lost exact request coordinates: %+v", observed)
+		}
+		observed.Repository = "caller mutation"
+	}
+	_, observed, err := ResolveManifestObserved(c, oci.Ref{Repo: "other/image", Tag: "sha256:" + strings.Repeat("0", 64)}, "amd64")
+	if err == nil || observed != nil {
+		t.Fatal("digest mismatch produced source evidence")
+	}
+	_, observed, err = ResolveManifestObserved(c, oci.Ref{Repo: "retry/image", Tag: "latest"}, "amd64")
+	if err != nil || observed.Repository != "retry/image" {
+		t.Fatalf("failed request contaminated retry: %+v %v", observed, err)
+	}
+}
+
+func TestManifestObservationRejectsSensitiveEndpointBeforeFetch(t *testing.T) {
+	for _, base := range []string{"https://user:secret@registry.invalid", "https://registry.invalid?token=secret", "https://registry.invalid?", "https://registry.invalid#secret", "https://registry.invalid#"} {
+		c := oci.NewClient(base)
+		c.HTTP = &http.Client{Transport: observationTransport(func(r *http.Request) (*http.Response, error) { t.Fatal("unsafe endpoint fetched"); return nil, nil })}
+		_, observed, err := ResolveManifestObserved(c, oci.Ref{Repo: "team/image", Tag: "latest"}, "amd64")
+		if err == nil || observed != nil || strings.Contains(err.Error(), "secret") {
+			t.Fatalf("unsafe endpoint leaked or succeeded: %+v %v", observed, err)
+		}
+	}
+}
+
+func TestManifestObservationRejectsWrongRequestedIndexDigest(t *testing.T) {
+	c := oci.NewClient("https://registry.invalid")
+	index := `{"manifests":[{"digest":"sha256:child","platform":{"architecture":"amd64"}}]}`
+	c.HTTP = &http.Client{Transport: observationTransport(func(r *http.Request) (*http.Response, error) {
+		body := index
+		if r.URL.Path == "/token" {
+			body = `{"token":"fixture"}`
+		}
+		if strings.HasSuffix(r.URL.Path, "sha256:child") {
+			t.Fatal("fetched child of unverified requested index")
+		}
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	_, observed, err := ResolveManifestObserved(c, oci.Ref{Repo: "team/image", Tag: "sha256:" + strings.Repeat("0", 64)}, "amd64")
+	if err == nil || observed != nil {
+		t.Fatal("wrong requested index digest produced observations")
 	}
 }

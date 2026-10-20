@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -422,6 +423,10 @@ func ResolveManifestObserved(c *oci.Client, ref oci.Ref, platform string) (*oci.
 		timeout = oci.DefaultHeaderTimeout
 	}
 	base := strings.TrimRight(c.Base, "/")
+	endpoint, err := url.Parse(base)
+	if err != nil || endpoint.Host == "" || (endpoint.Scheme != "https" && endpoint.Scheme != "http") || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.ForceQuery || endpoint.Fragment != "" || strings.Contains(base, "#") {
+		return nil, nil, fmt.Errorf("unsafe registry endpoint for observed resolution")
+	}
 
 	token, err := fetchRegistryToken(httpClient, base, ref.Repo, timeout)
 	if err != nil {
@@ -433,13 +438,16 @@ func ResolveManifestObserved(c *oci.Client, ref oci.Ref, platform string) (*oci.
 	}
 	sum := sha256.Sum256(body)
 	topDigest := "sha256:" + hex.EncodeToString(sum[:])
+	if strings.HasPrefix(ref.Tag, "sha256:") && ref.Tag != topDigest {
+		return nil, nil, fmt.Errorf("requested manifest digest mismatch: got %s want %s", topDigest, ref.Tag)
+	}
 
 	var m oci.Manifest
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, nil, fmt.Errorf("manifest decode: %w", err)
 	}
 	if len(m.Manifests) == 0 {
-		return &m, &ManifestObservation{ManifestDigest: topDigest, Config: ConfigObservation{Descriptor: m.Config}}, nil
+		return &m, &ManifestObservation{RegistryEndpoint: base, Repository: ref.Repo, RequestedReference: ref.Tag, ManifestDigest: topDigest, Config: ConfigObservation{Descriptor: m.Config}}, nil
 	}
 
 	var pick *oci.Descriptor
@@ -494,7 +502,7 @@ func ResolveManifestObserved(c *oci.Client, ref oci.Ref, platform string) (*oci.
 	if err := json.Unmarshal(body2, &pm); err != nil {
 		return nil, nil, fmt.Errorf("platform manifest decode: %w", err)
 	}
-	return &pm, &ManifestObservation{ManifestDigest: pick.Digest, IndexDigest: topDigest, PlatformDescriptor: &PlatformObservation{Architecture: pick.Platform.Architecture, Variant: pick.Platform.Variant}, Config: ConfigObservation{Descriptor: pm.Config}}, nil
+	return &pm, &ManifestObservation{RegistryEndpoint: base, Repository: ref.Repo, RequestedReference: ref.Tag, ManifestDigest: pick.Digest, IndexDigest: topDigest, PlatformDescriptor: &PlatformObservation{Architecture: pick.Platform.Architecture, Variant: pick.Platform.Variant}, Config: ConfigObservation{Descriptor: pm.Config}}, nil
 }
 
 func defaultPlatform(platform string) string {

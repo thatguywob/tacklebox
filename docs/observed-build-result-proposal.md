@@ -30,6 +30,19 @@ It retains the hash of the index at selection time.
 A direct manifest has no index observation.
 The resolver checks the child hash against its descriptor.
 It does not fetch the tag again for evidence.
+A request by digest must match the bytes of the manifest or index.
+
+The optional fields `registryEndpoint`, `repository` and `requestedReference`
+retain the exact coordinates of that resolve operation.
+They are additive fields in version 1. Older results can omit all three.
+The endpoint is a transport and can be a proxy. It does not prove the origin.
+Endpoints with credentials, queries or fragments fail before a request.
+
+A collector must check these coordinates against the actual operation and an
+independently reviewed map from origin to transport. It can then combine the
+declared origin, consumed repository and observed child digest into a reference.
+An unknown mapping must stay unbound. These fields do not observe CPU policy
+or authenticate the producer.
 
 `platformDescriptor` contains architecture and variant from the index.
 These fields do not prove hardware support.
