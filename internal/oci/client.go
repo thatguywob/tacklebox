@@ -491,7 +491,13 @@ func (c *Client) ResolveManifestForPlatformWithDigest(ref Ref, platform, expecte
 	}
 	if len(m.Manifests) == 0 {
 		sum := sha256.Sum256(body)
-		return &m, "sha256:" + hex.EncodeToString(sum[:]), nil
+		digest := "sha256:" + hex.EncodeToString(sum[:])
+		// A tag may name a platform manifest directly. It must satisfy the
+		// same caller pin as a manifest reached through an index descriptor.
+		if want := strings.TrimSpace(expectedDigest); want != "" && digest != want {
+			return nil, "", &ManifestDigestMismatchError{Want: want, Got: digest}
+		}
+		return &m, digest, nil
 	}
 	pick := matchPlatformDescriptor(m.Manifests, wantArch, wantVar)
 	if pick == nil {
