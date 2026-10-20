@@ -104,6 +104,8 @@ done
 # This covers initqueue, the cmdline fallback, and direct udev/service calls.
 # Do not let the done-marker shortcut bypass a required readiness check.
 if [ "$x13s_required" = 1 ]; then
+    tbox_x13s_reason="ADSP readiness check failed"
+    tbox_x13s_resolved_device=
     if ! tbox_x13s_prepare_device "$dev_selector" "$wait"; then
         [ "$wait" = 1 ] && die "Tacklebox: X13s external root blocked: $tbox_x13s_reason"
         exit 75

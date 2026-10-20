@@ -1,3 +1,6 @@
+# shellcheck shell=bash
+# The sourcing dracut main loop supplies these four variables.
+# shellcheck disable=SC2154
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright 2005-2013 Red Hat, Inc. All rights reserved.
 # License text: dracut108-install-control-flow.sh.LICENSE
