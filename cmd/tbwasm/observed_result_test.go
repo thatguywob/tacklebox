@@ -282,7 +282,12 @@ func observedMustReject(t *testing.T, p js.Value, message string) {
 
 func observedIntrospect(t *testing.T) {
 	t.Helper()
-	facts := observedMustResolve(t, js.Global().Call("tboxIntrospect", observedFixtureImage, observedFixtureRegistry))
+	observedIntrospectImage(t, observedFixtureImage)
+}
+
+func observedIntrospectImage(t *testing.T, image string) {
+	t.Helper()
+	facts := observedMustResolve(t, js.Global().Call("tboxIntrospect", image, observedFixtureRegistry))
 	var decoded purefs.ImageFacts
 	if err := json.Unmarshal([]byte(facts.String()), &decoded); err != nil {
 		t.Fatal(err)
@@ -339,7 +344,7 @@ func observedDecodeResult(t *testing.T, value js.Value) purefs.ObservedBuildResu
 	return result
 }
 
-func observedAssertSource(t *testing.T, f *observedFixture, result purefs.ObservedBuildResult, configVerified bool) {
+func observedAssertIdentity(t *testing.T, f *observedFixture, result purefs.ObservedBuildResult, configVerified bool) {
 	t.Helper()
 	source := result.ObservedInputs.Source
 	if result.BytesWritten <= 0 || result.ObservedInputs.SchemaVersion != 1 {
@@ -354,6 +359,11 @@ func observedAssertSource(t *testing.T, f *observedFixture, result purefs.Observ
 	if source.Config.Descriptor.Digest != f.config.Digest || source.Config.Descriptor.Size != f.config.Size || source.Config.Descriptor.MediaType != f.config.MediaType || source.Config.BytesVerified != configVerified {
 		t.Fatalf("config observation = %+v, want descriptor %+v and bytesVerified=%v", source.Config, f.config, configVerified)
 	}
+}
+
+func observedAssertSource(t *testing.T, f *observedFixture, result purefs.ObservedBuildResult, configVerified bool) {
+	t.Helper()
+	observedAssertIdentity(t, f, result, configVerified)
 	if got := result.ObservedInputs.Overlay; got.Status != "custom-image" || got.ManifestDigest != "" || got.LayersApplied || got.BaseAnnotationMatched {
 		t.Fatalf("custom image falsely claims an overlay: %+v", got)
 	}
@@ -646,4 +656,186 @@ func TestObservedResultRetainsOriginalIndexAndIsOperationLocal(t *testing.T) {
 		t.Fatalf("second build count %d differs from streamed %d", second.BytesWritten, *secondCount)
 	}
 	observedAssertBaseUnchanged(t, base)
+}
+
+const observedOverlayImage = "tuna-os/fixture:test"
+const observedOverlayPayload = "tbox-overlay-contract-payload: present only when this delta was applied\n"
+
+// addOverlay aliases the base image into the TunaOS namespace and publishes an
+// index-selected overlay containing the shared base layer plus a real tar delta.
+func (f *observedFixture) addOverlay(t *testing.T) string {
+	t.Helper()
+	var delta bytes.Buffer
+	tw := tar.NewWriter(&delta)
+	for _, name := range []string{"usr/share/tbox-overlay-contract.txt", "usr/share/tbox-overlay-second.txt"} {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(observedOverlayPayload)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(tw, observedOverlayPayload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	aliases := map[string][]byte{}
+	for name, data := range f.documents {
+		if strings.HasPrefix(name, "/v2/fixture/boot/") {
+			aliases[strings.Replace(name, "/v2/fixture/boot/", "/v2/tuna-os/fixture/", 1)] = data
+		}
+	}
+	for name, data := range aliases {
+		f.documents[name] = data
+	}
+	deltaDigest := observedDigest(delta.Bytes())
+	manifest := observedJSON(t, map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     "application/vnd.oci.image.manifest.v1+json",
+		"config":        f.config,
+		"annotations":   map[string]string{purefs.LiveOverlayActualBaseDigestAnnotation: f.manifestDigest},
+		"layers": []oci.Descriptor{
+			{MediaType: "application/vnd.oci.image.layer.v1.tar", Digest: f.layerDigest, Size: int64(len(f.documents["/v2/fixture/boot/blobs/"+f.layerDigest]))},
+			{MediaType: "application/vnd.oci.image.layer.v1.tar", Digest: deltaDigest, Size: int64(delta.Len())},
+		},
+	})
+	// Assert the hash of the consumed bytes, including harmless formatting.
+	manifest = append(append([]byte(" \n"), manifest...), '\n')
+	digest := observedDigest(manifest)
+	index := observedJSON(t, map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     "application/vnd.oci.image.index.v1+json",
+		"manifests": []map[string]any{{
+			"mediaType": "application/vnd.oci.image.manifest.v1+json",
+			"digest":    digest,
+			"size":      len(manifest),
+			"platform":  map[string]string{"architecture": "amd64", "os": "linux"},
+		}},
+	})
+	f.documents["/v2/tuna-os/live-overlay/manifests/fixture-test"] = index
+	f.documents["/v2/tuna-os/live-overlay/manifests/"+digest] = manifest
+	f.documents["/v2/tuna-os/live-overlay/blobs/"+deltaDigest] = append([]byte(nil), delta.Bytes()...)
+	return digest
+}
+
+type observedPayloadScan struct {
+	written int64
+	found   bool
+}
+
+// Scan across chunk boundaries without retaining an ISO in the Go heap. The
+// current EROFS author emits file bodies uncompressed, so the sentinel proves
+// overlay content reached (or did not reach) the actual streamed artifact.
+func observedPayloadSink(t *testing.T) (js.Func, *observedPayloadScan) {
+	t.Helper()
+	state := &observedPayloadScan{}
+	needle := []byte(observedOverlayPayload)
+	var scratch, tail []byte
+	cb := js.FuncOf(func(_ js.Value, args []js.Value) any {
+		n := args[0].Get("byteLength").Int()
+		state.written += int64(n)
+		if state.found {
+			return nil
+		}
+		size := len(tail) + n
+		if cap(scratch) < size {
+			scratch = make([]byte, size)
+		} else {
+			scratch = scratch[:size]
+		}
+		copy(scratch, tail)
+		js.CopyBytesToGo(scratch[len(tail):], args[0])
+		state.found = bytes.Contains(scratch, needle)
+		tail = append(tail[:0], scratch[max(0, size-len(needle)+1):]...)
+		return nil
+	})
+	t.Cleanup(cb.Release)
+	return cb, state
+}
+
+func observedOverlayOpts(t *testing.T, f *observedFixture, digest string, custom bool) js.Value {
+	t.Helper()
+	opts := observedOpts(t, f, false)
+	req := opts.Get("request")
+	req.Set("image", observedOverlayImage)
+	req.Set("customImage", custom)
+	if !custom {
+		req.Set("resolvedInputs", map[string]any{
+			"liveOverlayDigest":     digest,
+			"liveOverlayBaseDigest": f.manifestDigest,
+		})
+	}
+	return opts
+}
+
+func TestObservedResultAppliedOverlayThenFailedApplyAndCustomRetry(t *testing.T) {
+	f, shim := observedSetup(t)
+	overlayDigest := f.addOverlay(t)
+	observedIntrospectImage(t, observedOverlayImage)
+	base := observedBaseSnapshot(t)
+	appliedSink, appliedScan := observedPayloadSink(t)
+	applied := observedDecodeResult(t, observedMustResolve(t, js.Global().Call("tboxBuildIsoWithResult", observedOverlayOpts(t, f, overlayDigest, false), appliedSink)))
+	observedAssertIdentity(t, f, applied, false)
+	if got := applied.ObservedInputs.Overlay; got.Status != "applied" || got.ManifestDigest != overlayDigest || !got.LayersApplied || !got.BaseAnnotationMatched {
+		t.Fatalf("applied overlay observation = %+v, want exact manifest %s and matching base annotation", got, overlayDigest)
+	}
+	if applied.BytesWritten != appliedScan.written || !appliedScan.found {
+		t.Fatalf("applied result count=%d streamed=%d overlay payload found=%v", applied.BytesWritten, appliedScan.written, appliedScan.found)
+	}
+	observedAssertBaseUnchanged(t, base)
+	if hits := f.hits("/v2/tuna-os/live-overlay/blobs/" + f.layerDigest); hits != 0 {
+		t.Fatalf("overlay fetched shared base layer %d times instead of skipping it", hits)
+	}
+
+	// Fail the second delta file after the first has already modified the
+	// operation-local tree. There must be no successful result or ISO chunks.
+	shim.Call("failWrite", "tbox-post.bin", 1)
+	defer shim.Call("failWrite", "")
+	failedSink, failedCount := observedCounter(t)
+	observedMustReject(t, js.Global().Call("tboxBuildIsoWithResult", observedOverlayOpts(t, f, overlayDigest, false), failedSink), "fixture write failure")
+	if *failedCount != 0 || shim.Call("successfulWrites").Int() != 1 {
+		t.Fatalf("failed overlay wrote %d ISO bytes after %d accepted delta writes", *failedCount, shim.Call("successfulWrites").Int())
+	}
+	observedAssertBaseUnchanged(t, base)
+	if names := shim.Call("names").String(); strings.Contains(names, "post") {
+		t.Fatalf("failed overlay leaked its writable arena: %s", names)
+	}
+	shim.Call("failWrite", "")
+
+	customSink, customScan := observedPayloadSink(t)
+	custom := observedDecodeResult(t, observedMustResolve(t, js.Global().Call("tboxBuildIsoWithResult", observedOverlayOpts(t, f, overlayDigest, true), customSink)))
+	observedAssertSource(t, f, custom, false)
+	if custom.BytesWritten != customScan.written || customScan.found {
+		t.Fatalf("custom retry count=%d streamed=%d stale overlay payload found=%v", custom.BytesWritten, customScan.written, customScan.found)
+	}
+	observedAssertBaseUnchanged(t, base)
+}
+
+func TestObservedByteCountBoundaries(t *testing.T) {
+	calls := 0
+	sink := js.FuncOf(func(js.Value, []js.Value) any { calls++; return nil })
+	defer sink.Release()
+	writer := &jsChunkWriter{cb: sink.Value, written: 1<<31 - 2}
+	if n, err := writer.Write([]byte("four")); n != 4 || err != nil {
+		t.Fatalf("write n=%d err=%v", n, err)
+	}
+	if writer.written != 1<<31+2 {
+		t.Fatalf("count overflowed: %d", writer.written)
+	}
+	value := js.ValueOf(writer.written)
+	if value.Type() != js.TypeNumber || value.Float() != float64(int64(1<<31+2)) {
+		t.Fatalf("legacy numeric count changed: %v", value)
+	}
+	writer.written = 1<<53 - 2
+	if _, err := writer.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if writer.written != 1<<53-1 {
+		t.Fatalf("last safe count %d", writer.written)
+	}
+	before := calls
+	if n, err := writer.Write([]byte("x")); n != 0 || err == nil || calls != before || writer.written != 1<<53-1 {
+		t.Fatalf("unsafe numeric count accepted n=%d count=%d err=%v", n, writer.written, err)
+	}
 }

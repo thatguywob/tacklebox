@@ -1,99 +1,117 @@
-# Observed browser build result
+# Observed build results
 
-This API supports tunaOS#3470 and iso-builder#270. It is not a release
-receipt, authentication claim, or qualification result. No deployed caller or
-engine pin changes with this implementation.
+This API supports tunaOS#3470 and iso-builder#270.
+It reports observations from the engine.
+It does not qualify media.
+It does not authenticate a producer.
+The consumer and its engine pin stay unchanged.
 
-## Compatibility boundary
+## API contract
 
-Keep `tboxBuildIso(opts, onChunk)` returning its current numeric byte count.
-Add `tboxBuildIsoWithResult(opts, onChunk)` through the same build implementation.
-Its successful result contains `bytesWritten` and versioned `observedInputs`.
-No global last-result getter is provided. Failures reject without a result;
-the caller must discard partial output. Reset or a later operation cannot
-reuse a preceding operation's result.
+`tboxBuildIso(opts, onChunk)` returns a Promise with a numeric byte count.
+`tboxBuildIsoWithResult(opts, onChunk)` returns a Promise with an object.
+The object contains `bytesWritten` and `observedInputs`.
+The schema version is 1.
+Both APIs use the same build path.
 
-The existing asynchronous entry points share mutable image and OPFS state.
-Before adding evidence, use one operation-scoped state snapshot and reject
-overlapping introspect/build/reset operations. Otherwise a result can describe
-another operation's image, even when every individual digest is correct.
-Test concurrency, reset, rejected sinks, retry and failed introspection.
+The engine returns a result after output and cleanup succeed.
+An error rejects the Promise without a result.
+Discard partial output after an error.
+No API exposes a result from a previous operation.
 
-## Observations and their limits
+The byte count has a maximum of 9007199254740991.
+The engine rejects output that would exceed this limit before it calls the sink.
+This limit preserves an exact integer in JavaScript.
 
-- Source manifest: hash the exact platform-manifest bytes selected for this
-  operation. Preserve the already verified index descriptor relationship.
-- Index: retain the hash of the exact index bytes used for selection, when
-  present. A direct manifest has no observed index. Do not reread a mutable tag
-  after the build and treat that as the selected index.
-- Platform: return the selected descriptor's architecture and variant as
-  descriptor evidence, not measured hardware compatibility. A direct manifest
-  lacks this evidence until a configuration blob is fetched and verified.
-  Requested platform and CPU baseline are not substitutes for observations.
-- Config: distinguish a descriptor read from the source manifest from config
-  bytes consumed and digest-verified by the engine. Current offline-layout
-  code consumes config bytes; ordinary builds do not. Do not promote the
-  descriptor to verified content or force an extra download for bookkeeping.
-- Overlay: retain the resolved overlay manifest digest at graft time. Record
-  whether its layers were successfully applied and whether an actual base
-  annotation was present and matched. Missing annotations are not verified
-  base linkage. Custom-image and absent-overlay cases remain explicit.
-- Boot inputs: a later step can hash the exact kernel, assembled initramfs and
-  selected EFI payload bytes while they are consumed. Merely naming their
-  paths or copying requested IDs is not byte verification.
+## Source evidence
 
-The build request remains expected input. Never populate observed fields by
-copying `resolvedInputs`, installer revision, engine revision, catalog identity
-or requested target. Frontend identity requires its producer's own receipt;
-the backend hash cannot stand in for the frontend commit.
+The resolver hashes the exact bytes of each manifest.
+It retains the hash of the index at selection time.
+A direct manifest has no index observation.
+The resolver checks the child hash against its descriptor.
+It does not fetch the tag again for evidence.
 
-## Small implementation sequence
+`platformDescriptor` contains architecture and variant from the index.
+These fields do not prove hardware support.
+A direct manifest has no platform descriptor.
+The API does not copy a requested platform into this field.
 
-1. Fix and regress direct-manifest expected-digest enforcement separately.
-   The current OCI resolver checks pins only after index selection.
-2. Add per-operation resolution observations without changing legacy resolver
-   selection semantics. Two current resolvers differ on amd64/v2 fallback;
-   consolidation or policy changes are a separate reviewed decision.
-3. Add overlay observations at the existing apply boundary, with nil result
-   on errors. Test mismatch, absent overlay, zero-layer overlay and failed apply.
-4. Add the compatible WASM result API and actual JS/native tests for old/new
-   return shapes, interleaving, sink errors and no stale results.
-5. Only after review and native CI: pin the engine in iso-builder and consume
-   the result. Join independent browser media hashes and trusted artifact
-   context to the schema; retain diagnostic status until real boot/install
-   acceptance and producer frontend identity are available.
+The source manifest contains a descriptor for the config.
+The API retains that descriptor without an extra download.
+`bytesVerified` starts as false.
 
-## Verification scope
+An offline build consumes the config blob.
+The reader checks its digest on close.
+Only successful verification sets `bytesVerified` to true.
+A descriptor alone does not prove that the engine consumed those bytes.
 
-Use in-memory HTTP transports and tiny synthetic layers, no production image
-downloads or physical disks. Test observed digests against exact fixture bytes,
-not fixture labels. Run package tests, `go vet`, native and WASM builds, then
-existing smoke gates on the final published head. A synthetic test proves the
-API behavior, not that a real ISO boots or installs.
+## Overlay evidence
 
-## Public API contract
+The engine retains the digest when it resolves the overlay.
+It reports that digest only after it applies the layers.
+An error returns no observation.
+An overlay without new layers retains its existing error behavior.
 
-- tboxBuildIso keeps its numeric Promise result. tboxBuildIsoWithResult returns
-  an object with bytesWritten and observedInputs (schemaVersion 1).
-- tboxReset keeps its successful synchronous null return and immediately
-  invalidates the source. OPFS deletion completes asynchronously. A subsequent
-  operation waits for that cleanup before accessing files.
-- tboxResetAsync returns a Promise that completes after cleanup. It is useful
-  when callers need cleanup errors or completion explicitly.
-- A reset or another stateful call during an active operation rejects without
-  mutating the active operation. Callers must handle that rejected Promise.
-- Build cleanup errors reject the build without a result. Reset cleanup errors
-  block subsequent operations. Retrying reset retries incomplete cleanup;
-  successful removals are remembered.
-- Failed introspection clears prior facts and evidence. Each build clones only
-  tree metadata and xattrs, retaining immutable blob refs. Per-build post and
-  offline-metadata arenas are discarded, so retries start from the same base.
-- The source config descriptor is retained without extra I/O. bytesVerified
-  becomes true only after the offline build consumes and verifies the blob.
-- Overlay status absent means no overlay was applied under the existing
-  optional-overlay policy; it does not establish that a registry has no overlay.
+`baseAnnotationMatched` is true only when an annotation exists and matches the source digest.
+An absent annotation does not prove linkage.
+A requested digest does not count as an observed annotation.
 
-The engine does not synthesize requested CPU baseline, hardware target, frontend
-revision or boot proof. The selected platform descriptor is explicitly labeled
-as descriptor evidence. Synthetic runtime tests exercise contracts and isolation,
-not firmware, a bootable fixture, or installation qualification.
+The status `custom-image` means the caller chose to omit the curated overlay.
+The status `absent` means this build did not apply an overlay.
+This follows the existing policy for optional overlays.
+It does not prove that the registry has no overlay.
+
+## State and reset
+
+The engine reserves an operation before its Promise starts.
+If an operation is active, the engine rejects another call without a change to state.
+This rule covers introspection, builds, exports and reset.
+Handle the rejected Promise.
+
+Each build copies mutable metadata and xattrs.
+It retains immutable references to blob content.
+It does not copy file bodies.
+The base tree stays unchanged.
+
+Each build owns its post arena and offline metadata.
+Cleanup removes those arenas after success or failure.
+The next build starts from the same base.
+
+`tboxReset()` keeps its synchronous null return on success.
+It clears state immediately.
+It queues OPFS cleanup.
+The next operation waits for that cleanup before it uses files.
+`tboxResetAsync()` returns a Promise for explicit completion and errors.
+A failed introspection also clears old facts and evidence.
+
+Cleanup aborts an open writer before deletion.
+A cleanup error rejects the build and blocks later operations.
+Reset can retry incomplete cleanup.
+After removal, the engine records success to avoid a second deletion.
+The original error remains available if cleanup also fails.
+
+## Limits and acceptance
+
+The API does not copy requested identity into evidence.
+This includes CPU baseline, hardware target and tool revisions.
+Frontend identity needs a receipt from its producer.
+A backend hash does not identify the frontend commit.
+
+Boot inputs need separate hashes of the bytes that the engine consumes.
+Paths and requested IDs do not provide those hashes.
+The current API does not claim those hashes.
+
+Resolver policies stay unchanged.
+The pure resolver lets amd64/v2 use a descriptor without a variant.
+The OCI resolver uses a stricter policy.
+A policy change needs separate review.
+
+Tests use small synthetic inputs without production downloads or physical disks.
+Tests check hashes and errors in native code.
+Tests for JavaScript execute WASM with a model of OPFS locks.
+The fixture files cannot boot.
+These tests do not qualify firmware, boot or installation.
+
+Before a consumer update, complete native CI and WASM tests, then review the result.
+Use a trusted collector for producer receipts and independent media hashes.
+Keep diagnostic status until real boot and install checks pass.

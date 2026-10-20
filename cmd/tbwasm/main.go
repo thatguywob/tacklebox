@@ -1127,7 +1127,7 @@ func mustSize(src func() (io.ReadCloser, error)) int64 {
 
 type jsChunkWriter struct {
 	cb      js.Value
-	written int
+	written int64
 }
 
 type jsSinkWriter = jsChunkWriter
@@ -1146,6 +1146,11 @@ func invokeJSSink(cb js.Value, u8 js.Value) (res js.Value, err error) {
 }
 
 func (w *jsChunkWriter) Write(p []byte) (int, error) {
+	// JavaScript numeric results must retain an exact integer byte count.
+	const maxSafeBytes int64 = 1<<53 - 1
+	if int64(len(p)) > maxSafeBytes-w.written {
+		return 0, fmt.Errorf("ISO byte count exceeds JavaScript safe integer range")
+	}
 	u8 := js.Global().Get("Uint8Array").New(len(p))
 	js.CopyBytesToJS(u8, p)
 	res, err := invokeJSSink(w.cb, u8)
@@ -1170,6 +1175,6 @@ func (w *jsChunkWriter) Write(p []byte) (int, error) {
 	} else if res.Type() == js.TypeBoolean && !res.Bool() {
 		return 0, fmt.Errorf("sink write failed: sink returned false")
 	}
-	w.written += len(p)
+	w.written += int64(len(p))
 	return len(p), nil
 }
