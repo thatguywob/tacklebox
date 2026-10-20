@@ -3,11 +3,13 @@
 // tbwasm is the browser entry for the tacklebox pure-Go core: the same
 // packages purebuild proves natively (registry pull → overlay unpack →
 // introspection → liveuser → EROFS → FAT ESP → ISO9660/El Torito),
-// compiled to WASM and exposed as three JS calls:
+// compiled to WASM and exposed through compatible JS calls:
 //
 //	tboxIntrospect(image, registry) → Promise<factsJSON>
 //	tboxBuildIso(opts, onChunk)     → Promise<bytesWritten>
-//	tboxReset()
+//	tboxBuildIsoWithResult(opts, onChunk) → Promise<ObservedBuildResult>
+//	tboxReset()                    → null (cleanup queued)
+//	tboxResetAsync()               → Promise<null>
 //
 // opts: { label, initrd: Uint8Array|null }. onChunk receives Uint8Array
 // pieces of the ISO as they stream — the caller appends them to an OPFS
@@ -28,10 +30,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall/js"
 
 	tacklebox "github.com/tuna-os/tacklebox"
@@ -48,6 +52,7 @@ var (
 	gImage          string
 	gPlatform       string
 	gManifestDigest string
+	gObserved       *purefs.ManifestObservation
 	gRequest        *purefs.BuildRequest
 	// gBlobArena retains the verified compressed base-layer bytes across
 	// the introspect/buildIso calls (the wasm heap cannot hold them, and
@@ -59,31 +64,169 @@ var (
 	gBlobSizes map[string]int64
 )
 
-func resetGlobalState() {
-	if gStore != nil {
-		gStore.destroy()
-	}
-	if gBlobArena != nil {
-		gBlobArena.Destroy()
-	}
+func clearGlobalState() {
 	gRoot, gStore = nil, nil
 	gBlobArena = nil
 	gBlobRefs, gBlobSizes = nil, nil
 	gClient, gManifest = nil, nil
 	gImage, gPlatform, gManifestDigest = "", "", ""
-	gRequest = nil
+	gRequest, gObserved = nil, nil
+	gFacts = purefs.ImageFacts{}
+}
+
+func resetGlobalState() error {
+	store, blobs := gStore, gBlobArena
+	clearGlobalState()
+	err := destroySource(store, blobs)
+	if err != nil {
+		operationMu.Lock()
+		resetErr, resetStore, resetBlobs = err, store, blobs
+		operationMu.Unlock()
+	}
+	return err
+}
+
+func destroySource(store *hybridStore, blobs *opfsArena) error {
+	var first error
+	if store != nil {
+		if store.arena != nil {
+			first = store.arena.Destroy()
+		}
+		if store.post != nil {
+			if err := store.post.Destroy(); first == nil {
+				first = err
+			}
+		}
+	}
+	if blobs != nil {
+		if err := blobs.Destroy(); first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+func registerAPIs() {
+	js.Global().Set("tboxIntrospect", js.FuncOf(introspect))
+	js.Global().Set("tboxBuildIso", js.FuncOf(buildIso))
+	js.Global().Set("tboxBuildIsoWithResult", js.FuncOf(buildIsoWithResult))
+	js.Global().Set("tboxBuildDdiIso", js.FuncOf(buildDdiIso))
+	js.Global().Set("tboxExportBuildRequest", js.FuncOf(exportBuildRequest))
+	js.Global().Set("tboxReset", js.FuncOf(func(js.Value, []js.Value) any { return resetOperation(false) }))
+	js.Global().Set("tboxResetAsync", js.FuncOf(func(js.Value, []js.Value) any { return resetOperation(true) }))
 }
 
 func main() {
-	js.Global().Set("tboxIntrospect", js.FuncOf(introspect))
-	js.Global().Set("tboxBuildIso", js.FuncOf(buildIso))
-	js.Global().Set("tboxBuildDdiIso", js.FuncOf(buildDdiIso))
-	js.Global().Set("tboxExportBuildRequest", js.FuncOf(exportBuildRequest))
-	js.Global().Set("tboxReset", js.FuncOf(func(js.Value, []js.Value) any {
-		resetGlobalState()
-		return nil
-	}))
+	registerAPIs()
 	select {}
+}
+
+var operationMu sync.Mutex
+var operationBusy bool
+var resetPending chan struct{}
+var resetErr error
+var resetStore *hybridStore
+var resetBlobs *opfsArena
+var cleanupArenas []*opfsArena
+
+func rememberCleanupFailure(arena *opfsArena, err error) {
+	operationMu.Lock()
+	defer operationMu.Unlock()
+	resetErr = errors.Join(resetErr, err)
+	if resetStore == nil && resetBlobs == nil {
+		resetStore, resetBlobs = gStore, gBlobArena
+	}
+	for _, prior := range cleanupArenas {
+		if prior == arena {
+			return
+		}
+	}
+	cleanupArenas = append(cleanupArenas, arena)
+}
+
+// Legacy reset invalidates logical state immediately and keeps its original
+// success return (null). Cleanup yields asynchronously; the next operation waits.
+func resetOperation(async bool) any {
+	operationMu.Lock()
+	if operationBusy {
+		operationMu.Unlock()
+		return promise(func() (any, error) { return nil, fmt.Errorf("tacklebox operation already in progress") })
+	}
+	pending := resetPending
+	if pending != nil {
+		select {
+		case <-pending:
+			pending = nil
+		default:
+		}
+	}
+	if pending == nil {
+		if resetErr == nil {
+			resetStore, resetBlobs = gStore, gBlobArena
+		}
+		clearGlobalState()
+		pending = make(chan struct{})
+		resetPending = pending
+		extras := append([]*opfsArena(nil), cleanupArenas...)
+		go func(done chan struct{}, store *hybridStore, blobs *opfsArena) {
+			var err error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						err = fmt.Errorf("reset cleanup panic: %v", r)
+					}
+				}()
+				err = destroySource(store, blobs)
+				for _, arena := range extras {
+					err = errors.Join(err, arena.Destroy())
+				}
+			}()
+			operationMu.Lock()
+			resetErr = err
+			if err == nil {
+				resetStore, resetBlobs = nil, nil
+				cleanupArenas = nil
+			}
+			close(done)
+			operationMu.Unlock()
+		}(pending, resetStore, resetBlobs)
+	}
+	operationMu.Unlock()
+	if !async {
+		return nil
+	}
+	return promise(func() (any, error) {
+		<-pending
+		operationMu.Lock()
+		err := resetErr
+		operationMu.Unlock()
+		return nil, err
+	})
+}
+
+// Acquire synchronously, before a Promise goroutine can yield to another call.
+func operationPromise(fn func() (any, error)) js.Value {
+	operationMu.Lock()
+	if operationBusy {
+		operationMu.Unlock()
+		return promise(func() (any, error) { return nil, fmt.Errorf("tacklebox operation already in progress") })
+	}
+	operationBusy = true
+	pending := resetPending
+	operationMu.Unlock()
+	return promise(func() (any, error) {
+		defer func() { operationMu.Lock(); operationBusy = false; operationMu.Unlock() }()
+		if pending != nil {
+			<-pending
+		}
+		operationMu.Lock()
+		cleanupErr := resetErr
+		operationMu.Unlock()
+		if cleanupErr != nil {
+			return nil, fmt.Errorf("reset cleanup failed: %w", cleanupErr)
+		}
+		return fn()
+	})
 }
 
 // promise runs fn on a goroutine and resolves/rejects a JS Promise.
@@ -287,8 +430,16 @@ func parseIntrospectArgs(args []js.Value) (image, registry, platform string, req
 
 func introspect(_ js.Value, args []js.Value) any {
 	image, registry, platform, req, argErr := parseIntrospectArgs(args)
-	return promise(func() (any, error) {
-		resetGlobalState()
+	return operationPromise(func() (any, error) {
+		if err := resetGlobalState(); err != nil {
+			return nil, err
+		}
+		complete := false
+		defer func() {
+			if !complete {
+				resetGlobalState()
+			}
+		}()
 		if argErr != nil {
 			return nil, argErr
 		}
@@ -312,10 +463,11 @@ func introspect(_ js.Value, args []js.Value) any {
 		}
 		ref := oci.Ref{Repo: repo, Tag: tag}
 		emitProgress("resolve", 0, 1)
-		m, manifestDigest, err := purefs.ResolveManifestWithDigest(c, ref, platform)
+		m, observed, err := purefs.ResolveManifestObserved(c, ref, platform)
 		if err != nil {
 			return nil, err
 		}
+		manifestDigest := observed.ManifestDigest
 		if req != nil {
 			if err := req.VerifyResolved(normImage, platform, manifestDigest); err != nil {
 				return nil, err
@@ -374,9 +526,11 @@ func introspect(_ js.Value, args []js.Value) any {
 		gClient, gManifest, gImage = c, m, normImage
 		gPlatform, gManifestDigest = platform, manifestDigest
 		gRequest = req
+		gObserved = observed
 		gFacts = purefs.Introspect(root, gStore)
 		reportMem("unpack")
 		b, _ := json.Marshal(gFacts)
+		complete = true
 		return string(b), nil
 	})
 }
@@ -387,7 +541,7 @@ func exportBuildRequest(_ js.Value, args []js.Value) any {
 	if len(args) > 0 && args[0].Type() != js.TypeUndefined && args[0].Type() != js.TypeNull {
 		req, err = extractBuildRequestFromOpts(args[0])
 		if err != nil {
-			return promise(func() (any, error) { return nil, err })
+			return operationPromise(func() (any, error) { return nil, err })
 		}
 	}
 	if req == nil && gRequest != nil {
@@ -407,7 +561,7 @@ func exportBuildRequest(_ js.Value, args []js.Value) any {
 			req.ResolvedInputs = &purefs.ResolvedInputs{PlatformManifestDigest: gManifestDigest}
 		}
 	}
-	return promise(func() (any, error) {
+	return operationPromise(func() (any, error) {
 		b, err := req.ExportJSON()
 		if err != nil {
 			return nil, err
@@ -416,7 +570,13 @@ func exportBuildRequest(_ js.Value, args []js.Value) any {
 	})
 }
 
-func buildIso(_ js.Value, args []js.Value) any {
+func buildIso(_ js.Value, args []js.Value) any           { return buildIsoResult(args, false) }
+func buildIsoWithResult(_ js.Value, args []js.Value) any { return buildIsoResult(args, true) }
+
+func buildIsoResult(args []js.Value, withResult bool) any {
+	if len(args) < 2 {
+		return operationPromise(func() (any, error) { return nil, fmt.Errorf("build requires options and output callback") })
+	}
 	opts := args[0]
 	onChunk := args[1]
 	req, reqErr := extractBuildRequestFromOpts(opts)
@@ -450,7 +610,16 @@ func buildIso(_ js.Value, args []js.Value) any {
 	if v := opts.Get("liveMarker"); v.Type() == js.TypeString {
 		liveMarker = v.String()
 	}
-	return promise(func() (any, error) {
+	return operationPromise(func() (result any, buildErr error) {
+		cleanup := func(arena *opfsArena) {
+			if arena != nil {
+				if err := arena.Destroy(); err != nil {
+					result = nil
+					buildErr = errors.Join(buildErr, fmt.Errorf("build cleanup: %w", err))
+					rememberCleanupFailure(arena, err)
+				}
+			}
+		}
 		if reqErr != nil {
 			return nil, reqErr
 		}
@@ -487,7 +656,12 @@ func buildIso(_ js.Value, args []js.Value) any {
 		if label == "" {
 			label = "TUNAOS"
 		}
-		root, store := gRoot, gStore
+		root := purefs.CloneTree(gRoot)
+		store := &hybridStore{arena: gStore.arena}
+		defer func() {
+			cleanup(store.post)
+		}()
+		observed := purefs.ObservedInputs{SchemaVersion: 1, Source: *gObserved, Overlay: purefs.OverlayObservation{Status: "custom-image"}}
 
 		// The request/target platform drives overlay resolution,
 		// base-digest verification, and ESP filename selection below: an
@@ -524,20 +698,23 @@ func buildIso(_ js.Value, args []js.Value) any {
 				expectedOverlay = strings.TrimSpace(activeReq.ResolvedInputs.LiveOverlayDigest)
 				expectedOverlayBase = strings.TrimSpace(activeReq.ResolvedInputs.LiveOverlayBaseDigest)
 			}
-			applied, overlayManifest, err := purefs.GraftLiveOverlayWithOptions(root, store, gClient, gImage, gManifest, purefs.GraftOptions{
+			applied, overlayManifest, overlayObserved, err := purefs.GraftLiveOverlayObserved(root, store, gClient, gImage, gManifest, purefs.GraftOptions{
 				Platform:              platform,
 				ExpectedOverlayDigest: expectedOverlay,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("apply live overlay: %w", err)
 			}
+			observed.Overlay = *overlayObserved
 			if applied && overlayManifest != nil {
 				if expectedOverlayBase != "" && expectedOverlayBase != gManifestDigest {
 					return nil, &purefs.OverlayMismatchError{Reason: purefs.OverlayReasonBaseDigestMismatch, Want: gManifestDigest, Got: expectedOverlayBase}
 				}
-				if err := purefs.VerifyLiveOverlayBase(gManifest, overlayManifest, gManifestDigest); err != nil {
+				matched, err := purefs.VerifyObservedOverlayBase(gManifest, overlayManifest, gManifestDigest)
+				if err != nil {
 					return nil, fmt.Errorf("live overlay base verification: %w", err)
 				}
+				observed.Overlay.BaseAnnotationMatched = matched
 			}
 		}
 		emitProgress("overlay", 1, 1)
@@ -573,6 +750,19 @@ func buildIso(_ js.Value, args []js.Value) any {
 			if gBlobArena == nil {
 				return nil, fmt.Errorf("offline layout: no retained blobs (introspect an image first)")
 			}
+			layoutArena, merr := newOpfsArena("tbox-layout.bin", "c")
+			if merr != nil {
+				return nil, merr
+			}
+			defer cleanup(layoutArena)
+			blobRefs := make(map[string]string, len(gBlobRefs)+2)
+			blobSizes := make(map[string]int64, len(gBlobSizes)+2)
+			for digest, ref := range gBlobRefs {
+				blobRefs[digest] = ref
+			}
+			for digest, size := range gBlobSizes {
+				blobSizes[digest] = size
+			}
 			mediaJSON, merr := purefs.WriteMediaInputJSON(
 				activeReq.Image,
 				gManifestDigest,
@@ -599,15 +789,16 @@ func buildIso(_ js.Value, args []js.Value) any {
 			if merr != nil {
 				return nil, fmt.Errorf("offline layout config: %w", merr)
 			}
-			cfgRef, cfgSize, merr := retainArenaBlob(gBlobArena, gManifest.Config.Digest, cfgBody)
+			cfgRef, cfgSize, merr := retainArenaBlob(layoutArena, gManifest.Config.Digest, cfgBody)
 			if merr != nil {
 				return nil, fmt.Errorf("offline layout config: %w", merr)
 			}
 			if gManifest.Config.Size > 0 && cfgSize != gManifest.Config.Size {
 				return nil, fmt.Errorf("offline layout: retained config size %d != descriptor %d", cfgSize, gManifest.Config.Size)
 			}
-			gBlobRefs[gManifest.Config.Digest] = cfgRef
-			gBlobSizes[gManifest.Config.Digest] = cfgSize
+			observed.Source.Config.BytesVerified = true
+			blobRefs[gManifest.Config.Digest] = cfgRef
+			blobSizes[gManifest.Config.Digest] = cfgSize
 			// Platform manifest document: the decoded form cannot
 			// reproduce digest-identical bytes, so re-fetch once by digest
 			// (kilobytes) with hash verification.
@@ -615,31 +806,31 @@ func buildIso(_ js.Value, args []js.Value) any {
 			if merr != nil {
 				return nil, fmt.Errorf("offline layout manifest: %w", merr)
 			}
-			manifestRef, merr := retainArenaReader(gBlobArena, bytes.NewReader(manifestBytes))
+			manifestRef, merr := retainArenaReader(layoutArena, bytes.NewReader(manifestBytes))
 			if merr != nil {
 				return nil, fmt.Errorf("offline layout manifest: %w", merr)
 			}
-			gBlobRefs[gManifestDigest] = manifestRef
-			gBlobSizes[gManifestDigest] = int64(len(manifestBytes))
+			blobRefs[gManifestDigest] = manifestRef
+			blobSizes[gManifestDigest] = int64(len(manifestBytes))
 			// Every base layer must have been retained by the introspect
 			// unpack; a gap fails the build instead of shipping a layout
 			// with holes.
 			for _, l := range gManifest.Layers {
-				if _, ok := gBlobRefs[l.Digest]; !ok {
+				if _, ok := blobRefs[l.Digest]; !ok {
 					return nil, fmt.Errorf("offline layout: layer %s was not retained during unpack", l.Digest)
 				}
-				if l.Size > 0 && gBlobSizes[l.Digest] != l.Size {
-					return nil, fmt.Errorf("offline layout: retained layer %s size %d != descriptor %d", l.Digest, gBlobSizes[l.Digest], l.Size)
+				if l.Size > 0 && blobSizes[l.Digest] != l.Size {
+					return nil, fmt.Errorf("offline layout: retained layer %s size %d != descriptor %d", l.Digest, blobSizes[l.Digest], l.Size)
 				}
 			}
 			if err := purefs.WriteLiveMarkerFiles(root, store, mediaJSON); err != nil {
 				return nil, err
 			}
-			if err := gBlobArena.Seal(); err != nil {
+			if err := layoutArena.Seal(); err != nil {
 				return nil, fmt.Errorf("seal offline blob arena: %w", err)
 			}
 			offlineLayout, merr = purefs.OCILayoutInputs(
-				&arenaDigestStore{arena: gBlobArena, refs: gBlobRefs},
+				&arenaDigestStore{arena: gBlobArena, extra: layoutArena, refs: blobRefs},
 				gManifest, gManifestDigest, gManifest.Config.Digest,
 			)
 			if merr != nil {
@@ -667,7 +858,7 @@ func buildIso(_ js.Value, args []js.Value) any {
 		if err != nil {
 			return nil, err
 		}
-		defer sfsArena.Destroy()
+		defer cleanup(sfsArena)
 		if err := purefs.WriteErofs(root, store, arenaWriter{sfsArena}, 0); err != nil {
 			return nil, err
 		}
@@ -845,6 +1036,14 @@ func buildIso(_ js.Value, args []js.Value) any {
 		}
 		emitProgress("iso", 1, 1)
 		reportMem("iso")
+		if withResult {
+			result := purefs.ObservedBuildResult{BytesWritten: jw.written, ObservedInputs: observed}
+			encoded, err := json.Marshal(result)
+			if err != nil {
+				return nil, err
+			}
+			return js.Global().Get("JSON").Call("parse", string(encoded)), nil
+		}
 		return jw.written, nil
 	})
 }
@@ -897,6 +1096,7 @@ func retainArenaReader(a *opfsArena, r io.Reader) (string, error) {
 // retention happens through retainArenaBlob, not Put.
 type arenaDigestStore struct {
 	arena *opfsArena
+	extra *opfsArena
 	refs  map[string]string
 }
 
@@ -908,6 +1108,9 @@ func (s *arenaDigestStore) Open(ref string) (io.ReadCloser, error) {
 	r, ok := s.refs[ref]
 	if !ok {
 		return nil, fmt.Errorf("offline layout blob %q was not retained during unpack", ref)
+	}
+	if strings.HasPrefix(r, "c:") && s.extra != nil {
+		return s.extra.Open(r)
 	}
 	return s.arena.Open(r)
 }

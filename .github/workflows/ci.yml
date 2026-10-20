@@ -50,6 +50,11 @@ jobs:
       - name: go build
         run: go build ./...
 
+      - name: browser WASM compile and API contract
+        run: |
+          GOOS=js GOARCH=wasm go build -o /tmp/tbwasm.wasm ./cmd/tbwasm
+          GOOS=js GOARCH=wasm go test -timeout=3m -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./cmd/tbwasm
+
       # Stage 2: every example recipe must parse successfully. The build
       # tool itself enforces the schema; we just feed each one to a no-op
       # invocation and check exit status. --help short-circuits before any

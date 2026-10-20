@@ -7,6 +7,7 @@ import (
 
 	"github.com/tuna-os/tacklebox/internal/oci"
 )
+
 // Annotation keys a live-overlay publisher stamps on its platform manifest
 // recording which base platform manifest the delta was built against.
 // Either key satisfies verification; the "actual-" spelling is preferred.
@@ -181,12 +182,26 @@ func GraftLiveOverlayWithOptions(
 	baseManifest *oci.Manifest,
 	opts GraftOptions,
 ) (applied bool, overlayManifest *oci.Manifest, err error) {
+	applied, manifest, _, err := GraftLiveOverlayObserved(root, store, c, image, baseManifest, opts)
+	return applied, manifest, err
+}
+
+// GraftLiveOverlayObserved returns the resolved digest only after layers apply.
+// Absence is explicit and errors never return a successful observation.
+func GraftLiveOverlayObserved(
+	root *oci.Node,
+	store oci.BlobStore,
+	c *oci.Client,
+	image string,
+	baseManifest *oci.Manifest,
+	opts GraftOptions,
+) (applied bool, overlayManifest *oci.Manifest, observed *OverlayObservation, err error) {
 	if c == nil || root == nil || baseManifest == nil {
-		return false, nil, nil
+		return false, nil, &OverlayObservation{Status: "absent"}, nil
 	}
 	ref, ok := LiveOverlayRef(image)
 	if !ok {
-		return false, nil, nil
+		return false, nil, &OverlayObservation{Status: "absent"}, nil
 	}
 	platform := strings.TrimSpace(opts.Platform)
 	if platform == "" {
@@ -194,7 +209,7 @@ func GraftLiveOverlayWithOptions(
 	}
 	expected := strings.TrimSpace(opts.ExpectedOverlayDigest)
 	required := opts.Required || expected != ""
-	m, _, err := c.ResolveManifestForPlatformWithDigest(ref, platform, expected)
+	m, digest, err := c.ResolveManifestForPlatformWithDigest(ref, platform, expected)
 	if err != nil {
 		var notFound *oci.PlatformNotFoundError
 		var digestMismatch *oci.ManifestDigestMismatchError
@@ -203,18 +218,18 @@ func GraftLiveOverlayWithOptions(
 			// The overlay exists but is not the pinned one — always a
 			// blocker, even for otherwise-optional overlays: grafting
 			// the wrong delta is worse than grafting none.
-			return false, nil, &OverlayMismatchError{Image: image, Reason: OverlayReasonDigestMismatch, Want: digestMismatch.Want, Got: digestMismatch.Got}
+			return false, nil, nil, &OverlayMismatchError{Image: image, Reason: OverlayReasonDigestMismatch, Want: digestMismatch.Want, Got: digestMismatch.Got}
 		case errors.As(err, &notFound):
 			if !required {
-				return false, nil, nil
+				return false, nil, &OverlayObservation{Status: "absent"}, nil
 			}
-			return false, nil, &OverlayMismatchError{Image: image, Reason: OverlayReasonMissing, Want: platform, Got: strings.Join(notFound.Available, ", ")}
+			return false, nil, nil, &OverlayMismatchError{Image: image, Reason: OverlayReasonMissing, Want: platform, Got: strings.Join(notFound.Available, ", ")}
 		default:
 			// No overlay published for this variant — the common case.
 			if !required {
-				return false, nil, nil
+				return false, nil, &OverlayObservation{Status: "absent"}, nil
 			}
-			return false, nil, &OverlayMismatchError{Image: image, Reason: OverlayReasonMissing, Want: platform, Got: err.Error()}
+			return false, nil, nil, &OverlayMismatchError{Image: image, Reason: OverlayReasonMissing, Want: platform, Got: err.Error()}
 		}
 	}
 	skip := make(map[string]bool, len(baseManifest.Layers))
@@ -222,9 +237,9 @@ func GraftLiveOverlayWithOptions(
 		skip[l.Digest] = true
 	}
 	if err := c.UnpackOnto(root, ref, m, store, skip, opts.Progress); err != nil {
-		return false, nil, fmt.Errorf("apply live overlay %s:%s: %w", ref.Repo, ref.Tag, err)
+		return false, nil, nil, fmt.Errorf("apply live overlay %s:%s: %w", ref.Repo, ref.Tag, err)
 	}
-	return true, m, nil
+	return true, m, &OverlayObservation{Status: "applied", ManifestDigest: digest, LayersApplied: true}, nil
 }
 
 // VerifyLiveOverlayBase checks the grafted overlay's base-digest annotation

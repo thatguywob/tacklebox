@@ -396,12 +396,22 @@ const acceptOCIManifest = "application/vnd.oci.image.index.v1+json, " +
 // a bare fallback to Manifests[0], it refuses when a multi-arch index does not
 // contain the requested architecture.
 func ResolveManifestWithDigest(c *oci.Client, ref oci.Ref, platform string) (*oci.Manifest, string, error) {
+	m, observed, err := ResolveManifestObserved(c, ref, platform)
+	if err != nil {
+		return nil, "", err
+	}
+	return m, observed.ManifestDigest, nil
+}
+
+// ResolveManifestObserved retains evidence from the exact resolution requests.
+// Selection policy is identical to ResolveManifestWithDigest.
+func ResolveManifestObserved(c *oci.Client, ref oci.Ref, platform string) (*oci.Manifest, *ManifestObservation, error) {
 	if c == nil {
-		return nil, "", fmt.Errorf("nil oci client")
+		return nil, nil, fmt.Errorf("nil oci client")
 	}
 	wantArch, wantVar, err := ParsePlatform(defaultPlatform(platform))
 	if err != nil {
-		return nil, "", err
+		return nil, nil, err
 	}
 	httpClient := c.HTTP
 	if httpClient == nil {
@@ -415,21 +425,21 @@ func ResolveManifestWithDigest(c *oci.Client, ref oci.Ref, platform string) (*oc
 
 	token, err := fetchRegistryToken(httpClient, base, ref.Repo, timeout)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, err
 	}
 	body, err := fetchRegistryManifestBytes(httpClient, base, ref.Repo, ref.Tag, token, timeout)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, err
 	}
 	sum := sha256.Sum256(body)
 	topDigest := "sha256:" + hex.EncodeToString(sum[:])
 
 	var m oci.Manifest
 	if err := json.Unmarshal(body, &m); err != nil {
-		return nil, "", fmt.Errorf("manifest decode: %w", err)
+		return nil, nil, fmt.Errorf("manifest decode: %w", err)
 	}
 	if len(m.Manifests) == 0 {
-		return &m, topDigest, nil
+		return &m, &ManifestObservation{ManifestDigest: topDigest, Config: ConfigObservation{Descriptor: m.Config}}, nil
 	}
 
 	var pick *oci.Descriptor
@@ -468,23 +478,23 @@ func ResolveManifestWithDigest(c *oci.Client, ref oci.Ref, platform string) (*oc
 		}
 	}
 	if pick == nil {
-		return nil, "", fmt.Errorf("platform %q (arch %s) not found in manifest index for %s:%s", defaultPlatform(platform), wantArch, ref.Repo, ref.Tag)
+		return nil, nil, fmt.Errorf("platform %q (arch %s) not found in manifest index for %s:%s", defaultPlatform(platform), wantArch, ref.Repo, ref.Tag)
 	}
 
 	body2, err := fetchRegistryManifestBytes(httpClient, base, ref.Repo, pick.Digest, token, timeout)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, err
 	}
 	sum2 := sha256.Sum256(body2)
 	gotDigest := "sha256:" + hex.EncodeToString(sum2[:])
 	if gotDigest != pick.Digest {
-		return nil, "", fmt.Errorf("platform manifest digest mismatch: got %s want %s", gotDigest, pick.Digest)
+		return nil, nil, fmt.Errorf("platform manifest digest mismatch: got %s want %s", gotDigest, pick.Digest)
 	}
 	var pm oci.Manifest
 	if err := json.Unmarshal(body2, &pm); err != nil {
-		return nil, "", fmt.Errorf("platform manifest decode: %w", err)
+		return nil, nil, fmt.Errorf("platform manifest decode: %w", err)
 	}
-	return &pm, pick.Digest, nil
+	return &pm, &ManifestObservation{ManifestDigest: pick.Digest, IndexDigest: topDigest, PlatformDescriptor: &PlatformObservation{Architecture: pick.Platform.Architecture, Variant: pick.Platform.Variant}, Config: ConfigObservation{Descriptor: pm.Config}}, nil
 }
 
 func defaultPlatform(platform string) string {
