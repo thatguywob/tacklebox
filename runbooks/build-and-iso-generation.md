@@ -45,6 +45,23 @@ If two environments share an identical stateroot commit hash, verify will reject
 
 ## Remediation
 
+### A pinned live overlay resolves to a different manifest
+
+`resolvedInputs.liveOverlayDigest` pins the selected platform manifest, not
+the multi-architecture index. Both the native pure builder and browser pass
+this value to `GraftLiveOverlayWithOptions`.
+
+A tag can name either an index or a platform manifest directly. The latter
+path previously returned its hash without comparing the expected digest.
+The direct-manifest regression reproduces a wrong pin being accepted. Both
+paths now reject it with `ManifestDigestMismatchError`, before overlay layers
+are applied. Matching pins and unpinned calls keep their existing behavior.
+
+Check the requested platform-manifest pin against the exact served bytes.
+Do not replace it with the index digest or remove the pin to silence a
+mismatch. This check proves content identity against the supplied pin; it
+does not authenticate the source or establish boot qualification.
+
 1. **Storage Exhaustion**:
    - Ensure runner has sufficient temp storage (minimum 25GB free for multi-env ISO builds).
    - Clear stale container build caches (`podman system prune` or `docker system prune`).
