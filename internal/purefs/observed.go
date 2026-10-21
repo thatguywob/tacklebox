@@ -17,8 +17,14 @@ type ConfigObservation struct {
 	BytesVerified bool           `json:"bytesVerified"`
 }
 
-// ManifestObservation contains hashes of response bytes used for selection.
+// ManifestObservation contains hashes and request coordinates used for selection.
+// RegistryEndpoint is a transport, which may be a proxy; it is not an origin
+// assertion. A receipt collector must bind it and Repository to its independently
+// reviewed origin policy before constructing an immutable source reference.
 type ManifestObservation struct {
+	RegistryEndpoint   string               `json:"registryEndpoint,omitempty"`
+	Repository         string               `json:"repository,omitempty"`
+	RequestedReference string               `json:"requestedReference,omitempty"`
 	ManifestDigest     string               `json:"manifestDigest"`
 	IndexDigest        string               `json:"indexDigest,omitempty"`
 	PlatformDescriptor *PlatformObservation `json:"platformDescriptor,omitempty"`

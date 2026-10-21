@@ -344,11 +344,14 @@ func observedDecodeResult(t *testing.T, value js.Value) purefs.ObservedBuildResu
 	return result
 }
 
-func observedAssertIdentity(t *testing.T, f *observedFixture, result purefs.ObservedBuildResult, configVerified bool) {
+func observedAssertIdentity(t *testing.T, f *observedFixture, result purefs.ObservedBuildResult, configVerified bool, repository string) {
 	t.Helper()
 	source := result.ObservedInputs.Source
 	if result.BytesWritten <= 0 || result.ObservedInputs.SchemaVersion != 1 {
 		t.Fatalf("invalid result envelope: %+v", result)
+	}
+	if source.RegistryEndpoint != observedFixtureRegistry || source.Repository != repository || source.RequestedReference != "test" {
+		t.Fatalf("source request coordinates changed: %+v", source)
 	}
 	if source.ManifestDigest != f.manifestDigest || source.IndexDigest != f.indexDigest {
 		t.Fatalf("source identity = %+v, want original manifest %s and index %s", source, f.manifestDigest, f.indexDigest)
@@ -361,9 +364,13 @@ func observedAssertIdentity(t *testing.T, f *observedFixture, result purefs.Obse
 	}
 }
 
-func observedAssertSource(t *testing.T, f *observedFixture, result purefs.ObservedBuildResult, configVerified bool) {
+func observedAssertSource(t *testing.T, f *observedFixture, result purefs.ObservedBuildResult, configVerified bool, repositories ...string) {
 	t.Helper()
-	observedAssertIdentity(t, f, result, configVerified)
+	repository := "fixture/boot"
+	if len(repositories) != 0 {
+		repository = repositories[0]
+	}
+	observedAssertIdentity(t, f, result, configVerified, repository)
 	if got := result.ObservedInputs.Overlay; got.Status != "custom-image" || got.ManifestDigest != "" || got.LayersApplied || got.BaseAnnotationMatched {
 		t.Fatalf("custom image falsely claims an overlay: %+v", got)
 	}
@@ -648,6 +655,9 @@ func TestObservedResultRetainsOriginalIndexAndIsOperationLocal(t *testing.T) {
 	// Neither a prior build's verified-config flag nor mutations made by a
 	// JavaScript caller may contaminate the next operation's evidence.
 	first.Get("observedInputs").Get("source").Set("manifestDigest", "caller mutation")
+	first.Get("observedInputs").Get("source").Set("repository", "caller mutation")
+	first.Get("observedInputs").Get("source").Set("registryEndpoint", "caller mutation")
+	first.Get("observedInputs").Get("source").Set("requestedReference", "caller mutation")
 	first.Get("observedInputs").Get("source").Get("platformDescriptor").Set("architecture", "caller mutation")
 	secondSink, secondCount := observedCounter(t)
 	second := observedDecodeResult(t, observedMustResolve(t, js.Global().Call("tboxBuildIsoWithResult", observedOpts(t, f, false), secondSink)))
@@ -776,7 +786,7 @@ func TestObservedResultAppliedOverlayThenFailedApplyAndCustomRetry(t *testing.T)
 	base := observedBaseSnapshot(t)
 	appliedSink, appliedScan := observedPayloadSink(t)
 	applied := observedDecodeResult(t, observedMustResolve(t, js.Global().Call("tboxBuildIsoWithResult", observedOverlayOpts(t, f, overlayDigest, false), appliedSink)))
-	observedAssertIdentity(t, f, applied, false)
+	observedAssertIdentity(t, f, applied, false, "tuna-os/fixture")
 	if got := applied.ObservedInputs.Overlay; got.Status != "applied" || got.ManifestDigest != overlayDigest || !got.LayersApplied || !got.BaseAnnotationMatched {
 		t.Fatalf("applied overlay observation = %+v, want exact manifest %s and matching base annotation", got, overlayDigest)
 	}
@@ -805,7 +815,7 @@ func TestObservedResultAppliedOverlayThenFailedApplyAndCustomRetry(t *testing.T)
 
 	customSink, customScan := observedPayloadSink(t)
 	custom := observedDecodeResult(t, observedMustResolve(t, js.Global().Call("tboxBuildIsoWithResult", observedOverlayOpts(t, f, overlayDigest, true), customSink)))
-	observedAssertSource(t, f, custom, false)
+	observedAssertSource(t, f, custom, false, "tuna-os/fixture")
 	if custom.BytesWritten != customScan.written || customScan.found {
 		t.Fatalf("custom retry count=%d streamed=%d stale overlay payload found=%v", custom.BytesWritten, customScan.written, customScan.found)
 	}
@@ -837,5 +847,38 @@ func TestObservedByteCountBoundaries(t *testing.T) {
 	before := calls
 	if n, err := writer.Write([]byte("x")); n != 0 || err == nil || calls != before || writer.written != 1<<53-1 {
 		t.Fatalf("unsafe numeric count accepted n=%d count=%d err=%v", n, writer.written, err)
+	}
+}
+
+func TestIntrospectionObjectRequestRejectsPinBeforeOPFSAndUnpack(t *testing.T) {
+	f, shim := observedSetup(t)
+	req := observedOpts(t, f, true).Get("request")
+	req.Get("resolvedInputs").Set("platformManifestDigest", "sha256:"+strings.Repeat("0", 64))
+	wrapper := js.ValueOf(map[string]any{
+		"image": observedFixtureImage, "registry": observedFixtureRegistry, "platform": "amd64",
+		"request": js.Global().Get("JSON").Call("stringify", req).String(),
+	})
+	observedMustReject(t, js.Global().Call("tboxIntrospect", wrapper), "platformManifestDigest mismatch")
+	if shim.Call("count").Int() != 0 || f.hits("/v2/fixture/boot/blobs/"+f.layerDigest) != 0 || gObserved != nil || gRoot != nil {
+		t.Fatal("mismatched request reached OPFS/unpack or retained source evidence")
+	}
+}
+
+func TestIntrospectionFormsKeepExplicitPlatform(t *testing.T) {
+	for _, platform := range []string{"amd64", "arm64"} {
+		req := `{"schemaVersion":1,"kind":"build-request","customImage":true,"image":"fixture/boot:test","registry":"https://registry.invalid"}`
+		wrapper := js.ValueOf(map[string]any{"image": observedFixtureImage, "registry": observedFixtureRegistry, "platform": platform, "request": req})
+		image, registry, gotPlatform, parsed, err := parseIntrospectArgs([]js.Value{wrapper})
+		if err != nil || image != observedFixtureImage || registry != observedFixtureRegistry || gotPlatform != platform || parsed == nil {
+			t.Fatalf("object request lost explicit platform: %s %s %s %+v %v", image, registry, gotPlatform, parsed, err)
+		}
+		_, _, gotPlatform, parsed, err = parseIntrospectArgs([]js.Value{js.ValueOf(observedFixtureImage), js.ValueOf(observedFixtureRegistry), js.ValueOf(platform)})
+		if err != nil || gotPlatform != platform || parsed != nil {
+			t.Fatalf("legacy positional contract changed: %s %+v %v", gotPlatform, parsed, err)
+		}
+	}
+	_, _, platform, req, err := parseIntrospectArgs([]js.Value{js.ValueOf(observedFixtureImage), js.ValueOf(observedFixtureRegistry)})
+	if err != nil || platform != "amd64" || req != nil {
+		t.Fatal("legacy two-argument form changed")
 	}
 }
