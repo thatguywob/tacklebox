@@ -173,6 +173,10 @@ the Tacklebox core. It finds connected drives and inspects installed
 environments, storage use, and savings from deduplication. It also manages the
 lifecycle and verifies boot in a virtual machine after a write.
 
+On macOS and Windows, the GUI requires a container virtual machine backend
+(such as Podman Machine or WSL2 with Podman) to execute the containerized
+`bootc` and `sgdisk` build operations.
+
 ## 📋 Recipe Schema
 
 Configure Tacklebox with simple JSON recipes:
@@ -332,6 +336,12 @@ ISO targets (`--iso`) also need:
 
 [`docs/github-iso-setup.md`](docs/github-iso-setup.md) lists the distribution
 packages that provide the ISO tools, for both local builds and CI runners.
+
+### Desktop GUI (macOS & Windows)
+
+When using the GUI on macOS or Windows, a container virtual machine backend
+(such as Podman Machine or WSL2 with Podman) is required to execute the
+containerized `bootc` and `sgdisk` build operations.
 
 ## 📦 Releases & Operations
 
